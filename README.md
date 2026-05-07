@@ -7,7 +7,15 @@ Milton Silva de Jesus · Joaquim Luis Malacarne Lima de Oliveira · Pedro de Fra
 
 ## Visão geral
 
-GPU-V é um emulador de unidade de processamento gráfico implementado em C++17. Cada núcleo da GPU é modelado como uma CPU independente com a ISA RISC-V RV32I completa. O projeto simula em software o fluxo completo de uma GPU real: shader assembly → carregamento nos núcleos → execução paralela → gravação na VRAM via MMIO → double buffering → exibição visual.
+GPU-V é um emulador de unidade de processamento gráfico implementado em C++17. Cada núcleo da GPU é modelado como uma CPU independente com a ISA RISC-V RV32I completa. O projeto simula em software o fluxo completo de uma GPU real:
+
+```
+shader (binário RV32I) → carregamento nos núcleos → execução paralela
+→ leitura de máscara via MMIO → escrita na VRAM via MMIO
+→ double buffering → exibição em tempo real (SDL2)
+```
+
+A demo atual renderiza um **cubo 3D rotacionando em tempo real**. A CPU calcula as transformações 3D e a rasterização de arestas; os 64 núcleos RV32I pintam cada pixel em paralelo consultando uma máscara de aresta gravada na VRAM.
 
 ---
 
@@ -15,11 +23,15 @@ GPU-V é um emulador de unidade de processamento gráfico implementado em C++17.
 
 ```
 GPU_WALTER/
-├── main.cpp         — GPUManager, shader assembler, visualizador SDL2, main()
-├── RV32ICore.h      — Declaração do núcleo RV32I
-├── RV32ICore.cpp    — Implementação completa do pipeline (fetch/decode/execute)
-├── VRAM.h           — Memória de vídeo linear RGBA8888, lock-free
-└── gpu_v            — Binário compilado
+├── RV32Asm.h        — mini-montador RV32I (namespace de funções inline)
+├── VRAM.h           — memória de vídeo linear RGBA8888, lock-free
+├── RV32ICore.h/.cpp — pipeline fetch/decode/execute de um núcleo RV32I
+├── gpu.h/.cpp       — GPUManager: orquestração de núcleos e threads
+├── prog.h/.cpp      — shader RV32I (build_cube_shader)
+├── math3d.h/.cpp    — transformações 3D, projeção perspectiva, Bresenham
+├── janela.h/.cpp    — componente gráfico SDL2
+├── main.cpp         — loop principal de animação
+└── Makefile         — sistema de build
 ```
 
 ---
@@ -28,8 +40,9 @@ GPU_WALTER/
 
 | Dependência | Versão mínima | Uso |
 |---|---|---|
-| g++ / clang++ | C++17 | Compilação |
-| SDL2 | 2.0 | Janela visual antes/depois |
+| g++ | C++17 | Compilação |
+| SDL2 | 2.0 | Janela gráfica em tempo real |
+| pthreads | — | Threads dos núcleos |
 
 ### Instalação no Ubuntu/Debian
 
@@ -39,326 +52,268 @@ sudo apt install build-essential libsdl2-dev
 
 ---
 
-## Compilação
+## Compilação e execução
 
 ```bash
-g++ -std=c++17 -O2 -o gpu_v main.cpp RV32ICore.cpp $(pkg-config --cflags --libs sdl2)
-```
-
----
-
-## Execução
-
-```bash
-./gpu_v
+make        # compila
+./gpu_v     # executa
+make clean  # limpa objetos e binário
 ```
 
 Saída esperada no terminal:
 
 ```
-=== GPU-V: Emulador RISC-V RV32I ===
-Núcleos      : 64
-Pixels total : 1024
-Pixels/núcleo: 16
-
-Shader compilado: 22 instrução(ões).
-[GPU Manager] Disparando 64 núcleos em 8 thread(s) físicas.
-[GPU Manager] Back Buffer pronto.
-[GPU Manager] Swap efetuado — Front Buffer exibido.
-
-=== Diagnóstico de Frame ===
-  Pixels totais : 1024
-  Pixels escritos (≠0): 1024
-  ...
-
-[Visualizer] Janela aberta — faixa VERMELHA = ANTES | faixa VERDE = DEPOIS
-             Pressione ESC ou feche a janela para encerrar.
+GPU-V | shader: 19 instruções | 128×128 | 64 núcleos | 256 px/núcleo
 ```
 
-Após o terminal, abre uma janela SDL2. Feche com **ESC** ou pelo botão de fechar.
+Feche a janela com **ESC** ou pelo botão de fechar.
 
 ---
 
 ## Arquitetura
 
-O projeto é dividido em quatro componentes que refletem o design de uma GPU real.
+### 1. Mini-montador RV32I (`RV32Asm.h`)
 
-### 1. GPU Manager (`GPUManager` em `main.cpp`)
+Namespace de funções C++ `inline` que convertem operandos em palavras de instrução de 32 bits no formato RISC-V. Não há arquivo de assembly — o programa binário é construído diretamente em C++.
 
-Orquestra toda a simulação. Suas responsabilidades:
+```cpp
+// Chamada C++:
+LUI(8, 0x10)
 
-- Instanciar os N núcleos RV32I
-- Distribuir o mesmo programa shader para todos os núcleos via `load_program()`
-- Gerenciar um **thread pool dinâmico** limitado ao número de threads físicas do hardware (`std::thread::hardware_concurrency()`), evitando sobrecarga do SO
-- Dividir os núcleos em batches e executá-los com `std::async(std::launch::async, ...)`
-- Aguardar todos os núcleos finalizarem (`future::get()`) antes do swap
-- Realizar o **double buffering** real entre back e front buffer
+// A função monta os campos bit a bit:
+inline uint32_t LUI(int rd, int imm20) {
+    return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0x37;
+}
 
-```
-┌─────────────────────────────────────────────────┐
-│                  GPU Manager                    │
-│                                                 │
-│  load_program() → distribui para 64 núcleos     │
-│  dispatch_frame():                              │
-│    batch 0: núcleos 0–7   → 8 threads físicas   │
-│    batch 1: núcleos 8–15  → 8 threads físicas   │
-│    ...                                          │
-│    batch 7: núcleos 56–63 → 8 threads físicas   │
-│  swap_buffers() → back ↔ front, back limpo      │
-└─────────────────────────────────────────────────┘
+// Resultado: 0x00010437  (palavra de 32 bits = instrução RISC-V pronta)
+//
+// Formato U-type:
+//  bits [31:12] = imm20 = 0x10  →  registrador receberá 0x00010000
+//  bits [11:7]  = rd    = 8
+//  bits [6:0]   = opcode = 0x37 (LUI)
 ```
 
-### 2. Núcleos de processamento RV32I (`RV32ICore`)
+---
 
-Cada núcleo é uma instância autônoma com:
+### 2. Shader RV32I (`prog.cpp`)
 
-| Campo | Tipo | Descrição |
+`build_cube_shader()` retorna um `vector<uint32_t>` — o binário completo do shader. O mesmo binário é carregado em todos os 64 núcleos. Cada núcleo sabe qual é o seu ID (`mhartid` em `a0`) e usa isso para calcular quais pixels são seus.
+
+#### Layout da VRAM unificada (tamanho = 2 × total_pixels)
+
+```
+back_buffer.memory:
+┌─────────────────────────────┬─────────────────────────────┐
+│  [0 .. 16383]               │  [16384 .. 32767]           │
+│  buffer de cor (saída)      │  máscara de aresta (entrada)│
+│  núcleos escrevem aqui      │  CPU escreve antes do frame │
+└─────────────────────────────┴─────────────────────────────┘
+```
+
+#### Algoritmo do shader (pseudocódigo)
+
+```
+a0  = mhartid                            ← preenchido pelo construtor RV32ICore
+
+t0  = pixels_per_core (256)              ← LUI + ADDI
+t1  = mhartid × 256 (= base_addr)       ← ADDI(shift=8) + SLL
+t2  = total_pixels  (16384 = mask_base) ← LUI + ADDI
+s0  = 0x0000FFFF (azul)                 ← LUI(0x10) + ADDI(-1)
+t3  = 0 (i = 0)
+
+loop:
+    t4 = base_addr + i                   ← ADD   (output_addr)
+    t5 = mask_base + output_addr         ← ADD   (mask_addr)
+    t6 = VRAM[mask_addr]                 ← LW    (lê máscara via MMIO)
+    se t6 == 0: VRAM[output_addr] = 0    ← BEQ + SW  (preta)
+    senão:      VRAM[output_addr] = s0   ← SW        (azul)
+    i++                                  ← ADDI
+    se i != ppc: goto loop               ← BNE
+ECALL
+```
+
+#### Mapa de registradores
+
+| Reg | ABI | Valor |
 |---|---|---|
-| `pc` | `uint32_t` | Contador de programa exclusivo |
-| `registers[32]` | `uint32_t[]` | Banco de registradores x0–x31 |
-| `mhartid` | `uint32_t` | ID do núcleo (carregado em `a0` = x10) |
-| `instruction_memory` | `vector<uint32_t>` | Memória de instruções local |
-| `vram_ref` | `VRAM&` | Referência compartilhada à VRAM |
+| x10 | a0 | mhartid |
+| x5  | t0 | pixels_per_core (256) |
+| x6  | t1 | base_addr = mhartid × 256 |
+| x7  | t2 | mask_base = 16384 |
+| x8  | s0 | cor azul = 0x0000FFFF |
+| x28 | t3 | i (contador do loop) |
+| x29 | t4 | output_addr |
+| x30 | t5 | mask_addr |
+| x31 | t6 | valor lido da máscara |
 
-O núcleo implementa o pipeline em três estágios dentro de `step()`:
+---
+
+### 3. Núcleos RV32I (`RV32ICore`)
+
+Cada núcleo é uma instância autônoma com PC, banco de 32 registradores, memória de instrução local e referência à VRAM compartilhada.
+
+#### Pipeline em `step()`
 
 ```
-FETCH   → lê instruction_memory[pc/4]
-DECODE  → extrai opcode, rd, rs1, rs2, funct3, funct7, imediatos
-EXECUTE → executa e atualiza registradores / VRAM / PC
+FETCH   → inst = instruction_memory[pc / 4]
+DECODE  → opcode, rd, rs1, rs2, funct3, funct7, imediatos
+EXECUTE → atualiza registradores / VRAM / PC
 ```
 
-O modelo é **MIMD** (Multiple Instruction, Multiple Data): cada núcleo executa o mesmo binário do shader, mas sobre dados diferentes determinados pelo seu `mhartid`.
+- `x0` é hardwired zero: toda escrita em `registers[0]` é revertida.
+- `ECALL` retorna `false` de `step()`, encerrando o loop `execute()`.
 
 #### ISA implementada
 
 | Formato | Instruções |
 |---|---|
-| **Tipo-R** | ADD, SUB, SLL, SLT, SLTU, XOR, SRL, SRA, OR, AND |
-| **Tipo-I** | ADDI, SLTI, SLTIU, XORI, ORI, ANDI, SLLI, SRLI, SRAI |
-| **Tipo-I (load)** | LB, LH, LW, LBU, LHU (lê da VRAM via MMIO) |
-| **Tipo-S** | SW (escreve na VRAM via MMIO) |
-| **Tipo-B** | BEQ, BNE, BLT, BGE, BLTU, BGEU |
-| **Tipo-U** | LUI, AUIPC |
-| **Tipo-J** | JAL, JALR |
-| **Sistema** | ECALL (encerra o núcleo) |
+| Tipo-R | ADD, SUB, SLL, SLT, SLTU, XOR, SRL, SRA, OR, AND |
+| Tipo-I (ALU) | ADDI, SLTI, SLTIU, XORI, ORI, ANDI, SLLI, SRLI, SRAI |
+| Tipo-I (load) | LB, LH, LW, LBU, LHU — lê da VRAM via MMIO |
+| Tipo-S | SW — escreve na VRAM via MMIO |
+| Tipo-B | BEQ, BNE, BLT, BGE, BLTU, BGEU |
+| Tipo-U | LUI, AUIPC |
+| Tipo-J | JAL, JALR |
+| Sistema | ECALL (encerra o núcleo) |
 
-> x0 é hardwired zero: qualquer escrita em `registers[0]` é revertida após cada instrução.
+#### Barramento MMIO
 
-### 3. Barramento MMIO (`RV32ICore.cpp` linhas 127–146)
-
-Os núcleos não têm instruções especiais de vídeo. Eles usam as instruções padrão **LW** e **SW** da ISA em endereços que são mapeados diretamente para a VRAM — este é o conceito de **Memory-Mapped I/O (MMIO)**:
-
-```
-Instrução SW executada pelo núcleo
-         │
-         ▼
-case 0x23 (opcode Store):
-    addr = registers[rs1] + imm_S(inst)
-    vram_ref.write_pixel(addr, registers[rs2])
-```
-
-O endereço usado pelo shader é `base_addr + i`, onde `base_addr = mhartid * pixels_per_core`. Isso garante que cada núcleo escreva exclusivamente na sua faixa da VRAM, sem colisões.
-
-### 4. VRAM e Double Buffering (`VRAM.h` + `GPUManager`)
-
-#### VRAM
-
-Memória de vídeo linear: cada posição armazena um pixel no formato **RGBA8888** (32 bits).
-
-```
-Índice:   0          1          2       ...    1023
-         ┌──────────┬──────────┬──────────┬──────────┐
-VRAM:    │ RRGGBBAA │ RRGGBBAA │ RRGGBBAA │ RRGGBBAA │
-         └──────────┴──────────┴──────────┴──────────┘
-          Core 0                             Core 63
-          (px 0–15)                          (px 1008–1023)
-```
-
-A escrita é **lock-free**: como cada núcleo opera em faixas disjuntas calculadas pelo `mhartid`, não há condição de corrida e nenhuma trava (`mutex`) é necessária.
-
-#### Double Buffering
-
-```
-                  ┌──────────────┐
-  Núcleos 0–63 ──►│  back_buffer │ (invisível ao usuário)
-  escrevem aqui   └──────┬───────┘
-                         │ swap_buffers()
-                         │  std::swap(back.memory, front.memory)
-                         │  std::fill(back → zeros)   ← limpa para próximo frame
-                         ▼
-                  ┌──────────────┐
-  Usuário vê ────►│ front_buffer │ (frame completo e consistente)
-                  └──────────────┘
-```
-
-O usuário nunca vê um frame sendo construído pela metade. Somente após todos os núcleos terminarem (`future::get()`) é que `swap_buffers()` é chamado, tornando o frame visível atomicamente.
+Os núcleos não têm instruções especiais de vídeo. `LW` e `SW` em qualquer endereço são roteados para `vram_ref.read_pixel()` e `vram_ref.write_pixel()`. O shader lê a máscara e escreve cores usando as mesmas instruções de memória da ISA.
 
 ---
 
-## Shader de gradiente (`build_gradient_shader`)
+### 4. GPU Manager (`gpu.cpp`)
 
-O shader é um programa **escrito em binário RV32I** diretamente em C++, usando o mini-assembler no namespace `RV32Asm`. O resultado é um `vector<uint32_t>` com 18 instruções que é copiado para a memória de instrução de cada núcleo.
+Orquestra núcleos, threads e buffers.
 
-### Algoritmo (pseudocódigo)
+#### Threads
 
 ```
-// Executado por cada núcleo independentemente
-a0  = mhartid                      // preenchido pelo construtor
+Thread de controle  →  chama dispatch_frame()
+                        ├─ lança threads de núcleo em batches
+                        ├─ aguarda cada batch (f.get())
+                        └─ chama swap_buffers()
 
-t0  = pixels_per_core (= 16)       // LUI + ADDI
-t5  = log2(pixels_per_core) (= 4)  // ADDI
-t1  = mhartid << 4                 // SLL  → base_addr = mhartid * 16
-
-// Cálculo de cor somente com soma (ADD / ADDI):
-//   cor = mhartid * 1024 + 255
-//   mhartid * 1024 via 10 duplicações sucessivas (ADD t3, t3, t3)
-//   O valor final em 32 bits coloca B = mhartid*4 nos bits 15:8
-//   e A = 255 nos bits 7:0
-t3  = mhartid * 2                  // ADD
-t3  = t3 * 2   (= mhartid * 4)    // ADD
-...  (10 duplicações no total)
-t3  = mhartid * 1024               // ADD
-t2  = t3 + 255                     // ADDI  → cor = mhartid*1024 + 255
-
-t3  = 0  (i = 0)
-
-loop:
-    t4 = base_addr + i             // ADD
-    VRAM[t4] = cor                 // SW   (MMIO)
-    i++                            // ADDI
-    if i != pixels_per_core: goto loop  // BNE
-
-ECALL                              // encerra o núcleo
+Thread de núcleo    →  executa run_core(RV32ICore*)
+                        └─ chama core->execute() até ECALL
 ```
 
-### Mapa de registradores
+Batches são limitados a `std::thread::hardware_concurrency()` threads simultâneas — evita criar 64 threads em hardware com 8 cores físicos.
 
-| Registrador | ABI | Valor |
-|---|---|---|
-| x10 | a0 | mhartid (ID do núcleo) |
-| x5  | t0 | pixels_per_core (16) |
-| x6  | t1 | base_addr = mhartid × 16 |
-| x7  | t2 | cor RGBA calculada |
-| x28 | t3 | contador do loop (i) |
-| x29 | t4 | endereço VRAM atual |
-| x30 | t5 | temporário para shifts |
+```
+hw_threads = 8  →  64 núcleos / 8 = 8 batches
 
-### Gradiente de cores (preto → azul, somente soma)
+batch 0: núcleos  0–7   → 8 threads simultâneas → aguarda
+batch 1: núcleos  8–15  → ...
+...
+batch 7: núcleos 56–63  → aguarda → swap
+```
 
-Fórmula: `cor = mhartid × 1024 + 255`
+#### Double buffering
 
-| Núcleo | Cálculo | B (byte azul) | Cor RGBA | Visual |
-|---|---|---|---|---|
-| 0  | 0×1024+255   | 0   | `0x000000FF` | Preto opaco |
-| 16 | 16×1024+255  | 64  | `0x000040FF` | Azul escuro |
-| 32 | 32×1024+255  | 128 | `0x000080FF` | Azul médio  |
-| 48 | 48×1024+255  | 192 | `0x0000C0FF` | Azul claro  |
-| 63 | 63×1024+255  | 252 | `0x0000FCFF` | Azul pleno  |
+```
+                  ┌──────────────────────────────────────┐
+  CPU             │          back_buffer                 │
+  set_mask() ────►│ [16384..32767] = máscara de aresta   │
+                  │                                      │
+  Núcleos 0–63   │ [0..16383]     = buffer de cor       │◄── run_core() escreve
+                  └──────────────┬───────────────────────┘
+                                 │ swap_buffers()
+                                 │  copy [0..16383] → front_buffer
+                                 │  fill [0..16383] → zeros
+                                 ▼
+                  ┌──────────────────────────────────────┐
+  Janela vê ─────►│         front_buffer                 │
+                  │  frame completo e consistente        │
+                  └──────────────────────────────────────┘
+```
 
 ---
 
-## Visualização SDL2
+### 5. Matemática 3D (`math3d.cpp`)
 
-Após o processamento, abre uma janela com dois painéis lado a lado:
+Executada inteiramente na CPU com `float`. Os núcleos não precisam de ponto flutuante.
+
+| Função | O que faz |
+|---|---|
+| `rotate_yx` | Rotação em torno de Y e depois de X usando `cosf`/`sinf` |
+| `project` | Projeção perspectiva: divide por `(3.5 + z)`, mapeia para tela |
+| `bresenham` | Rasteriza segmentos de reta na máscara (layout row-major) |
+
+---
+
+### 6. Janela gráfica (`janela.cpp`)
+
+Encapsula todo o SDL2. `main.cpp` não inclui `<SDL2/SDL.h>`.
+
+| Método | Função |
+|---|---|
+| `Janela(title, w, h, scale)` | Cria janela, renderer e textura streaming |
+| `poll_events()` | Processa eventos; retorna `false` se ESC ou fechar |
+| `draw(pixels)` | Converte RRGGBBAA → ARGB8888 e renderiza |
+
+---
+
+## Fluxo completo por frame
 
 ```
-┌─────────────────────────┬─┬─────────────────────────┐
-│  faixa VERMELHA (ANTES) │ │  faixa VERDE  (DEPOIS)  │
-├─────────────────────────┤ ├─────────────────────────┤
-│                         │ │ ░░▒▒▓▓████████████████ │
-│     (tela preta)        │ │ ░░▒▒▓▓████████████████ │
-│     VRAM = zeros        │ │  preto → azul pleno     │
-└─────────────────────────┴─┴─────────────────────────┘
-  64 × 16 pixels × escala 10    separador de 4px
-  Largura total: 1284px  ·  Altura: 184px
+main()
+ │
+ ├─ CPU: rotate_yx(vértices, angle)      → transforma os 8 vértices do cubo
+ ├─ CPU: project(vértices)               → projeta para coordenadas de tela
+ ├─ CPU: bresenham(mask, arestas)        → marca pixels de aresta na máscara
+ │
+ ├─ gpu.set_mask(mask)                   → grava máscara em back_buffer[16384..]
+ ├─ gpu.load_program(shader)             → distribui 19 instruções para 64 núcleos
+ ├─ gpu.dispatch_frame()
+ │    ├─ 8 batches × 8 threads          → 64 núcleos executam shader em paralelo
+ │    │    └─ cada núcleo lê máscara (LW) e pinta cor (SW) via MMIO
+ │    └─ swap_buffers()                 → front_buffer recebe o frame pronto
+ │
+ ├─ janela.draw(gpu.get_pixels())        → exibe na tela
+ │
+ └─ angle += 0.02f  →  SDL_Delay(16ms)  → ~60 fps
 ```
-
-- Cada coluna = 1 núcleo (64 colunas no total)
-- Cada linha = 1 pixel dentro da fatia do núcleo (16 linhas)
-- Escala 10×: cada pixel da VRAM ocupa 10×10 px na tela
-- Fechar: **ESC** ou botão de fechar da janela
 
 ---
 
 ## Como modificar
 
-### Mudar resolução / número de núcleos
+### Mudar resolução
 
-Em `main()`:
+Em `main.cpp`:
 
 ```cpp
-const size_t NUM_CORES    = 64;    // quantidade de núcleos
-const size_t TOTAL_PIXELS = 1024;  // deve ser múltiplo de NUM_CORES
+const int    FB_W         = 128;   // largura em pixels
+const int    FB_H         = 128;   // altura em pixels
+const int    SCALE        = 5;     // escala da janela
+const size_t TOTAL_PIXELS = FB_W * FB_H;
+const size_t NUM_CORES    = 64;
 ```
 
-> `PIXELS_PER_CORE` precisa ser potência de 2 para que o cálculo de `base_addr` via `SLL` funcione corretamente.
+> `TOTAL_PIXELS / NUM_CORES` precisa ser potência de 2 para o cálculo de `base_addr` via `SLL` funcionar.
 
-### Mudar as cores do gradiente
+### Mudar a cor do cubo
 
-Em `build_gradient_shader()`, substitua o bloco de montagem da cor. Exemplos:
+Em `prog.cpp`, troque o bloco que carrega `s0`. Exemplos:
 
-**Gradiente preto → vermelho:**
 ```cpp
-prog.push_back(ADDI(30, 0, 2));    // t5 = 2
-prog.push_back(SLL (7, 10, 30));   // t2 = mhartid << 2  (R: 0..252)
-prog.push_back(ANDI(7,  7, 0xFF));
-prog.push_back(ADDI(30, 0, 24));   // t5 = 24
-prog.push_back(SLL (7,  7, 30));   // t2 = R << 24  → bits 31:24
-prog.push_back(ADDI(28, 0, 0xFF)); // A = 0xFF
-prog.push_back(OR  (7,  7, 28));   // t2 |= A
+// Vermelho: 0xFF0000FF
+prog.push_back(LUI (8, 0xFF001));   // 0xFF001000
+prog.push_back(ADDI(8, 8, -0xFF1)); // ajuste fino
+
+// Branco: 0xFFFFFFFF (LUI+ADDI encadeados)
+prog.push_back(LUI (8, 0xFFFFF));
+prog.push_back(ADDI(8, 8, -1));
 ```
 
-**Gradiente preto → verde:**
-```cpp
-prog.push_back(ADDI(30, 0, 2));
-prog.push_back(SLL (7, 10, 30));   // G: 0..252
-prog.push_back(ANDI(7,  7, 0xFF));
-prog.push_back(ADDI(30, 0, 16));   // G no byte bits 23:16
-prog.push_back(SLL (7,  7, 30));
-prog.push_back(ADDI(28, 0, 0xFF));
-prog.push_back(OR  (7,  7, 28));
-```
+O formato RGBA na VRAM é `0xRRGGBBAA` — R nos bits 31:24, G 23:16, B 15:8, A 7:0.
 
-O formato RGBA na VRAM é `0xRRGGBBAA`:
-- **R** → bits 31:24 (shift 24)
-- **G** → bits 23:16 (shift 16)
-- **B** → bits 15:8  (shift 8)
-- **A** → bits 7:0   (sem shift)
+### Adicionar outro shader
 
----
-
-## Fluxo de execução completo
-
-```
-main()
- │
- ├─ GPUManager(64 núcleos, 1024 pixels)
- │    └─ inicializa back_buffer[1024] = 0
- │    └─ inicializa front_buffer[1024] = 0
- │    └─ cria RV32ICore[0..63], cada um com referência ao back_buffer
- │
- ├─ before_snapshot = gpu.get_pixels()   → cópia do front_buffer (zeros)
- │
- ├─ build_gradient_shader(64, 1024)      → 18 instruções RV32I binárias
- ├─ gpu.load_program(shader)             → copia para instruction_memory de cada núcleo
- │
- ├─ gpu.dispatch_frame()
- │    ├─ batch 0: cores 0–7  → 8 std::async → executam shader → escrevem no back_buffer
- │    ├─ batch 1: cores 8–15 → ...
- │    ├─ ...
- │    ├─ batch 7: cores 56–63
- │    └─ swap_buffers()
- │         ├─ std::swap(back_buffer.memory, front_buffer.memory)
- │         └─ std::fill(back_buffer → zeros)
- │
- ├─ after_snapshot = gpu.get_pixels()    → cópia do front_buffer (gradiente pronto)
- │
- ├─ gpu.print_diagnostics()              → lê front_buffer, imprime estatísticas
- │
- └─ visualize_before_after(before, after, 64, 16)
-      └─ janela SDL2: painel ANTES (preto) | painel DEPOIS (gradiente azul)
-```
+1. Declare uma nova função em `prog.h`
+2. Implemente em `prog.cpp` usando `RV32Asm`
+3. Passe o vetor retornado para `gpu.load_program()` em `main.cpp`
 
 ---
 
@@ -366,10 +321,9 @@ main()
 
 | Item | Status | Observação |
 |---|---|---|
-| ISA RV32I inteira | Implementada | Todos os formatos R/I/S/B/U/J |
-| Multiplicação (RV32M) | Não implementada | Shader usa shifts para multiplicar por pot. de 2 |
-| Double buffering | Implementado | `std::swap` real entre back e front |
-| Renderização complexa | Não implementada | Apenas shaders de cor sólida por núcleo |
-| Síntese HLS (FPGA) | Trabalho futuro | Base C++ compatível com ferramentas HLS |
-| Extensão vetorial (RV32V) | Trabalho futuro | Permitiria SIMD por núcleo |
-| Texto na janela SDL2 | Não implementado | Requereria SDL2_ttf |
+| ISA RV32I | Implementada | Todos os formatos R/I/S/B/U/J |
+| Multiplicação (RV32M) | Não implementada | Shader usa SLL para pot. de 2 |
+| Double buffering | Implementado | copy + fill entre back e front |
+| Rasterização de sólidos | Não implementada | Apenas wireframe (arestas) |
+| Síntese HLS (FPGA) | Trabalho futuro | Base C++ compatível com HLS |
+| Extensão vetorial (RV32V) | Trabalho futuro | SIMD por núcleo |
