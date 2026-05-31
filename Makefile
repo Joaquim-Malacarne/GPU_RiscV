@@ -3,7 +3,7 @@ CXXFLAGS = -std=c++17 -O2 -Wall -Wextra
 LDFLAGS  = -lSDL2 -lpthread
 
 TARGET = gpu_v
-SRCS   = main.cpp RV32ICore.cpp gpu.cpp prog.cpp math3d.cpp janela.cpp
+SRCS   = main.cpp RV32ICore.cpp gpu.cpp geom_shader.cpp frag_shader.cpp janela.cpp
 OBJS   = $(SRCS:.cpp=.o)
 
 all: $(TARGET)

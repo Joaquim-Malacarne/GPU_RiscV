@@ -36,21 +36,31 @@ bool RV32ICore::step() {
     // ── EXECUTE ────────────────────────────────────────────────────────────
     switch (opcode) {
 
-        // ── Tipo-R (ADD, SUB, SLL, SLT, SLTU, XOR, SRL, SRA, OR, AND) ────
+        // ── Tipo-R: base RV32I + extensão M (funct7=0x01) ─────────────────
         case 0x33: {
             uint32_t a = registers[rs1];
             uint32_t b = registers[rs2];
             switch ((funct7 << 3) | funct3) {
-                case 0x000: registers[rd] = a + b;                     break; // ADD
-                case 0x200: registers[rd] = a - b;                     break; // SUB
-                case 0x001: registers[rd] = a << (b & 0x1F);           break; // SLL
-                case 0x002: registers[rd] = ((int32_t)a < (int32_t)b); break; // SLT
-                case 0x003: registers[rd] = (a < b);                   break; // SLTU
-                case 0x004: registers[rd] = a ^ b;                     break; // XOR
-                case 0x005: registers[rd] = a >> (b & 0x1F);           break; // SRL
-                case 0x205: registers[rd] = (int32_t)a >> (b & 0x1F); break; // SRA
-                case 0x006: registers[rd] = a | b;                     break; // OR
-                case 0x007: registers[rd] = a & b;                     break; // AND
+                // ── Base ISA (funct7 = 0x00 ou 0x20) ────────────────────
+                case 0x000: registers[rd] = a + b;                              break; // ADD
+                case 0x100: registers[rd] = a - b;                              break; // SUB  (fix: era 0x200)
+                case 0x001: registers[rd] = a << (b & 0x1F);                    break; // SLL
+                case 0x002: registers[rd] = ((int32_t)a < (int32_t)b) ? 1u : 0u; break; // SLT
+                case 0x003: registers[rd] = (a < b) ? 1u : 0u;                  break; // SLTU
+                case 0x004: registers[rd] = a ^ b;                              break; // XOR
+                case 0x005: registers[rd] = a >> (b & 0x1F);                    break; // SRL
+                case 0x105: registers[rd] = (uint32_t)((int32_t)a >> (b & 0x1F)); break; // SRA (fix: era 0x205)
+                case 0x006: registers[rd] = a | b;                              break; // OR
+                case 0x007: registers[rd] = a & b;                              break; // AND
+                // ── Extensão M (funct7 = 0x01) ───────────────────────────
+                case 0x008: registers[rd] = (uint32_t)((int32_t)a * (int32_t)b); break; // MUL
+                case 0x009: registers[rd] = (uint32_t)(((int64_t)(int32_t)a * (int64_t)(int32_t)b) >> 32); break; // MULH
+                case 0x00A: registers[rd] = (uint32_t)(((int64_t)(int32_t)a * (int64_t)b) >> 32); break; // MULHSU
+                case 0x00B: registers[rd] = (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32); break; // MULHU
+                case 0x00C: registers[rd] = (b == 0) ? 0xFFFFFFFFu : (uint32_t)((int32_t)a / (int32_t)b); break; // DIV
+                case 0x00D: registers[rd] = (b == 0) ? 0xFFFFFFFFu : a / b;    break; // DIVU
+                case 0x00E: registers[rd] = (b == 0) ? a : (uint32_t)((int32_t)a % (int32_t)b); break; // REM
+                case 0x00F: registers[rd] = (b == 0) ? a : a % b;               break; // REMU
             }
             break;
         }

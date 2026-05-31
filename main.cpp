@@ -1,76 +1,71 @@
 /*
- * GPU-V  —  Emulador de GPU baseado em RISC-V RV32I
+ * GPU-V  —  Emulador de GPU baseado em RISC-V RV32I+M
  * Universidade Católica de Santos
  *
- * main.cpp: loop principal de animação.
- *   gpu.cpp    → gerenciamento de núcleos e threads
- *   prog.cpp   → programa shader RV32I
- *   math3d.cpp → transformações 3D e rasterização de arestas
- *   janela.cpp → componente gráfico SDL2
+ * main.cpp: orquestra inicialização e loop de animação.
+ *
+ * Toda a matemática 3D (rotação, projeção, Bresenham) roda nos núcleos RV32I.
+ * A CPU apenas atualiza o ângulo e dispara os shaders.
  */
 
 #include <iostream>
-#include <vector>
-#include <algorithm>
-#include <cmath>
 #include <thread>
 #include <chrono>
 
+#include "config.h"
 #include "gpu.h"
-#include "prog.h"
-#include "math3d.h"
+#include "geom_shader.h"
+#include "frag_shader.h"
 #include "janela.h"
 
-static const int    FB_W         = 128;
-static const int    FB_H         = 128;
-static const int    SCALE        = 5;
-static const size_t TOTAL_PIXELS = (size_t)(FB_W * FB_H);
-static const size_t NUM_CORES    = 64;   // ppc = 256 = 2^8
-
 int main() {
-    GPUManager gpu(NUM_CORES, TOTAL_PIXELS);
-    const auto shader = build_cube_shader((uint32_t)NUM_CORES, (uint32_t)TOTAL_PIXELS);
+    const size_t N = (size_t)(FB_W * FB_H);   // total de pixels
 
-    std::cout << "GPU-V | shader: " << shader.size() << " instruções"
-              << " | " << FB_W << "×" << FB_H
-              << " | " << NUM_CORES << " núcleos"
-              << " | " << TOTAL_PIXELS / NUM_CORES << " px/núcleo\n";
+    // ── Inicializa GPU ────────────────────────────────────────────────────
+    GPUManager gpu(NUM_CORES, N, NUM_THREADS);
 
+    // Grava sin/cos LUT e vértices do cubo na VRAM (uma única vez)
+    init_geometry_vram(gpu.vram(), N);
+
+    // Compila shaders RV32I uma única vez
+    const auto geom_prog = build_geometry_shader((uint32_t)N, FB_W, FB_H);
+    const auto frag_prog = build_fragment_shader((uint32_t)NUM_CORES, (uint32_t)N);
+
+    std::cout << "GPU-V | geom shader: " << geom_prog.size() << " instr"
+              << " | frag shader: "      << frag_prog.size() << " instr"
+              << " | " << FB_W << "x" << FB_H
+              << " | " << NUM_CORES << " nucleos"
+              << " | threads: " << (NUM_THREADS ? NUM_THREADS : (int)std::thread::hardware_concurrency())
+              << "\n";
+
+    // Pré-carrega o fragment shader em todos os núcleos (não muda entre frames)
+    gpu.load_program(frag_prog);
+
+    // ── Janela SDL2 ───────────────────────────────────────────────────────
     Janela janela("GPU-V | Cubo 3D  —  ESC para sair", FB_W, FB_H, SCALE);
 
-    std::vector<uint32_t> mask(TOTAL_PIXELS);
-    float verts[8][3];
-    float sv[8][2];
-    float angle = 0.0f;
+    uint32_t angle_idx = 0;
 
+    // ── Loop principal ────────────────────────────────────────────────────
     while (janela.poll_events()) {
-        // ── CPU: transforma vértices ──────────────────────────────────────────
-        for (int v = 0; v < 8; v++) {
-            verts[v][0] = CUBE_VERTS[v][0];
-            verts[v][1] = CUBE_VERTS[v][1];
-            verts[v][2] = CUBE_VERTS[v][2];
-            rotate_yx(verts[v], angle * 0.6f, angle);
-        }
 
-        // ── CPU: projeta e rasteriza arestas na máscara ───────────────────────
-        for (int v = 0; v < 8; v++)
-            project(verts[v], FB_W, FB_H, sv[v][0], sv[v][1]);
+        // 1. CPU grava o ângulo atual na VRAM
+        gpu.set_angle(angle_idx);
 
-        std::fill(mask.begin(), mask.end(), 0u);
-        for (int e = 0; e < 12; e++)
-            bresenham(mask, FB_W, FB_H,
-                      (int)sv[CUBE_EDGES[e][0]][0], (int)sv[CUBE_EDGES[e][0]][1],
-                      (int)sv[CUBE_EDGES[e][1]][0], (int)sv[CUBE_EDGES[e][1]][1]);
+        // 2. Geometry shader (núcleo 0): rotação + projeção + Bresenham
+        gpu.load_geometry(geom_prog, 0);
+        gpu.dispatch_geometry(0);
 
-        // ── GPU: grava máscara, carrega shader, processa frame ────────────────
-        gpu.set_mask(mask);
-        gpu.load_program(shader);
+        // 3. Fragment shader (64 núcleos): lê máscara, pinta pixels
+        gpu.load_program(frag_prog);
         gpu.dispatch_frame();
 
-        // ── Exibe ─────────────────────────────────────────────────────────────
+        // 4. Exibe o frame
         janela.draw(gpu.get_pixels());
 
-        angle += 0.02f;
+        // Avança ~0.6° por frame (256 passos = volta completa ≈ 14s)
+        angle_idx = (angle_idx + 1) & 0xFF;
+
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
 
