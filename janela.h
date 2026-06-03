@@ -2,6 +2,7 @@
 #define JANELA_H
 
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <SDL2/SDL.h>
 
@@ -29,7 +30,10 @@ private:
     SDL_Window*           win;
     SDL_Renderer*         ren;
     SDL_Texture*          tex;
-    std::vector<uint32_t> sdl_buf; // buffer de conversão de formato
+    std::vector<uint32_t> sdl_buf;
+    std::string           base_title;
+    int                   fps_frames = 0;
+    Uint32                fps_last   = 0;
 };
 
 #endif // JANELA_H

@@ -1,9 +1,10 @@
 #include "janela.h"
 #include <iostream>
+#include <string>
 
 Janela::Janela(const char* title, int fb_w, int fb_h, int scale)
     : fb_w(fb_w), fb_h(fb_h), win(nullptr), ren(nullptr), tex(nullptr),
-      sdl_buf((size_t)(fb_w * fb_h)) {
+      sdl_buf((size_t)(fb_w * fb_h)), base_title(title), fps_last(SDL_GetTicks()) {
 
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::cerr << "[Janela] SDL_Init falhou: " << SDL_GetError() << "\n";
@@ -13,9 +14,12 @@ Janela::Janela(const char* title, int fb_w, int fb_h, int scale)
     win = SDL_CreateWindow(title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         fb_w * scale, fb_h * scale,
-        SDL_WINDOW_SHOWN);
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
 
     ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    // Mantém o framebuffer lógico fb_w×fb_h independente do tamanho da janela.
+    // SDL escala automaticamente ao renderizar.
+    SDL_RenderSetLogicalSize(ren, fb_w, fb_h);
 
     // ARGB8888: A nos bits 31-24, R 23-16, G 15-8, B 7-0
     tex = SDL_CreateTexture(ren,
@@ -54,4 +58,13 @@ void Janela::draw(const std::vector<uint32_t>& pixels) {
     SDL_RenderClear(ren);
     SDL_RenderCopy(ren, tex, nullptr, nullptr);
     SDL_RenderPresent(ren);
+
+    ++fps_frames;
+    Uint32 now = SDL_GetTicks();
+    if (now - fps_last >= 1000) {
+        std::string title = base_title + "  |  " + std::to_string(fps_frames) + " FPS";
+        SDL_SetWindowTitle(win, title.c_str());
+        fps_frames = 0;
+        fps_last   = now;
+    }
 }

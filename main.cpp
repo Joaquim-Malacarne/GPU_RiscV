@@ -2,10 +2,12 @@
  * GPU-V  —  Emulador de GPU baseado em RISC-V RV32I+M
  * Universidade Católica de Santos
  *
- * main.cpp: orquestra inicialização e loop de animação.
+ * Modelo de threads:
+ *   • Thread da tela  (1)             — SDL2: poll de eventos + draw
+ *   • Threads de cálculo (COMPUTE_THREADS = 7) — spin loop contínuo na GPU
  *
- * Toda a matemática 3D (rotação, projeção, Bresenham) roda nos núcleos RV32I.
- * A CPU apenas atualiza o ângulo e dispara os shaders.
+ *   As 7 threads de cálculo nunca dormem: fazem spin nas barreiras entre fases.
+ *   O top/htop mostrará 100% em cada uma delas.
  */
 
 #include <iostream>
@@ -17,57 +19,55 @@
 #include "geom_shader.h"
 #include "frag_shader.h"
 #include "janela.h"
+#include "shared_frame.h"
 
 int main() {
-    const size_t N = (size_t)(FB_W * FB_H);   // total de pixels
+    const size_t N = (size_t)(FB_W * FB_H);
 
     // ── Inicializa GPU ────────────────────────────────────────────────────
-    GPUManager gpu(NUM_CORES, N, NUM_THREADS);
-
-    // Grava sin/cos LUT e vértices do cubo na VRAM (uma única vez)
+    GPUManager gpu(NUM_CORES, N);
     init_geometry_vram(gpu.vram(), N);
 
-    // Compila shaders RV32I uma única vez
     const auto geom_prog = build_geometry_shader((uint32_t)N, FB_W, FB_H);
     const auto frag_prog = build_fragment_shader((uint32_t)NUM_CORES, (uint32_t)N);
 
-    std::cout << "GPU-V | geom shader: " << geom_prog.size() << " instr"
-              << " | frag shader: "      << frag_prog.size() << " instr"
+    std::cout << "GPU-V | geom: " << geom_prog.size() << " instr"
+              << " | frag: "      << frag_prog.size() << " instr"
               << " | " << FB_W << "x" << FB_H
               << " | " << NUM_CORES << " nucleos"
-              << " | threads: " << (NUM_THREADS ? NUM_THREADS : (int)std::thread::hardware_concurrency())
-              << "\n";
+              << " | 1 thread tela + " << COMPUTE_THREADS << " threads calculo (spin 100%)\n";
 
-    // Pré-carrega o fragment shader em todos os núcleos (não muda entre frames)
-    gpu.load_program(frag_prog);
+    gpu.set_programs(geom_prog, frag_prog);
 
-    // ── Janela SDL2 ───────────────────────────────────────────────────────
-    Janela janela("GPU-V | Cubo 3D  —  ESC para sair", FB_W, FB_H, SCALE);
+    // ── Buffer compartilhado tela ↔ cálculo ──────────────────────────────
+    SharedFrame shared;
+    shared.pixels.resize(N);
 
-    uint32_t angle_idx = 0;
+    // ── Thread da tela (SDL2) — consome SharedFrame ───────────────────────
+    std::thread screen_thread([&]() {
+        Janela janela("GPU-V | Cubo 3D  —  ESC para sair", FB_W, FB_H, SCALE);
 
-    // ── Loop principal ────────────────────────────────────────────────────
-    while (janela.poll_events()) {
+        while (true) {
+            if (!janela.poll_events()) {
+                std::lock_guard<std::mutex> lk(shared.mtx);
+                shared.stop = true;
+                shared.cv.notify_all();
+                break;
+            }
+            // Aguarda novo frame por até 16 ms (mantém poll de eventos responsivo)
+            std::unique_lock<std::mutex> lk(shared.mtx);
+            if (shared.cv.wait_for(lk, std::chrono::milliseconds(16),
+                                   [&]{ return shared.ready || shared.stop; })) {
+                if (shared.stop) break;
+                janela.draw(shared.pixels);
+                shared.ready = false;
+            }
+        }
+    });
 
-        // 1. CPU grava o ângulo atual na VRAM
-        gpu.set_angle(angle_idx);
+    // ── 7 threads de cálculo em spin loop — bloqueia até shared.stop ─────
+    gpu.run_continuous(shared);
 
-        // 2. Geometry shader (núcleo 0): rotação + projeção + Bresenham
-        gpu.load_geometry(geom_prog, 0);
-        gpu.dispatch_geometry(0);
-
-        // 3. Fragment shader (64 núcleos): lê máscara, pinta pixels
-        gpu.load_program(frag_prog);
-        gpu.dispatch_frame();
-
-        // 4. Exibe o frame
-        janela.draw(gpu.get_pixels());
-
-        // Avança ~0.6° por frame (256 passos = volta completa ≈ 14s)
-        angle_idx = (angle_idx + 1) & 0xFF;
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
-    }
-
+    screen_thread.join();
     return 0;
 }

@@ -1,6 +1,7 @@
 #include "geom_shader.h"
 #include "vram_layout.h"
 #include "RV32Asm.h"
+#include "config.h"
 #include <cmath>
 
 /*
@@ -67,9 +68,10 @@ void init_geometry_vram(VRAM& vram, size_t N) {
 // ── Montador do shader ────────────────────────────────────────────────────────
 
 // Emite o bloco Bresenham para uma aresta (v0, v1).
-// screen_base está em x8, N está em x4.
+// screen_base está em x8, N está em x4, W está em x9.
 // Tamanho fixo: 39 instruções (19 setup + 20 loop).
-static void emit_bresenham(std::vector<uint32_t>& p, int v0, int v1) {
+static void emit_bresenham(std::vector<uint32_t>& p, int v0, int v1,
+                           uint32_t W, uint32_t H) {
     using namespace RV32Asm;
     // ── Setup (19 instruções) ──────────────────────────────────────────────
     // x26=x0, x27=y0, x17=x1, x18=y1 (endereços word no screen_verts)
@@ -110,9 +112,9 @@ static void emit_bresenham(std::vector<uint32_t>& p, int v0, int v1) {
     //  +4   BEQ   x30, x0, +32   → se fora, pula para skip_write (+36)
     //  +8   SLTIU x30, x27, 128   → y_in_bounds?
     //  +12  BEQ   x30, x0, +24   → se fora, pula para skip_write (+36)
-    //  +16  SLLI  x30, x27, 7
+    //  +16  MUL   x30, x27, x9   → y*W  (x9 = W, funciona para qualquer W)
     //  +20  ADD   x30, x30, x26
-    //  +24  ADD   x30, x30, x4    → addr = N + y*128 + x
+    //  +24  ADD   x30, x30, x4    → addr = N + y*W + x
     //  +28  ADDI  x31, x0, 1
     //  +32  SW    x31, x30, 0     → mask[addr] = 1
     // skip_write:
@@ -133,11 +135,11 @@ static void emit_bresenham(std::vector<uint32_t>& p, int v0, int v1) {
     // done:
     //  +80  (próximo bloco ou ECALL)
 
-    p.push_back(SLTIU(30, 26, 128));    // 20
+    p.push_back(SLTIU(30, 26, (int)W));  // 20
     p.push_back(BEQ  (30,  0, +32));    // 21 → skip_write
-    p.push_back(SLTIU(30, 27, 128));    // 22
+    p.push_back(SLTIU(30, 27, (int)H)); // 22
     p.push_back(BEQ  (30,  0, +24));    // 23 → skip_write
-    p.push_back(SLLI (30, 27,   7));    // 24 y*128
+    p.push_back(MUL  (30, 27,  9));     // 24 y*W  (x9 = W, qualquer resolução)
     p.push_back(ADD  (30, 30,  26));    // 25
     p.push_back(ADD  (30, 30,   4));    // 26 +N  (x4=N)
     p.push_back(ADDI (31,  0,   1));    // 27
@@ -158,10 +160,14 @@ static void emit_bresenham(std::vector<uint32_t>& p, int v0, int v1) {
 
 // ── build_geometry_shader ─────────────────────────────────────────────────────
 
-std::vector<uint32_t> build_geometry_shader(uint32_t N, uint32_t W, uint32_t /*H*/) {
+std::vector<uint32_t> build_geometry_shader(uint32_t N, uint32_t W, uint32_t H) {
     using namespace RV32Asm;
     std::vector<uint32_t> p;
-    (void)W; // W=128 fixo; usamos SLTIU 128 diretamente
+
+    const int half_W  = (int)(W / 2);
+    const int half_H  = (int)(H / 2);
+    const int proj_W  = (int)std::round(CUBE_SCALE * W);
+    const int proj_H  = (int)std::round(CUBE_SCALE * H);
 
     // ── Prólogo: carregar constantes de base ──────────────────────────────
     // x4 = N
@@ -179,11 +185,24 @@ std::vector<uint32_t> build_geometry_shader(uint32_t N, uint32_t W, uint32_t /*H
     p.push_back(ADDI(7, 6, 256));       // x7 = 2N+513 (verts_base)
     p.push_back(ADDI(8, 7, 24));        // x8 = 2N+537 (screen_base)
 
+    // x9 = W (largura do framebuffer — usado em Bresenham para y*W)
+    {
+        uint32_t hi = (W >> 12) & 0xFFFFF;
+        int32_t  lo = (int32_t)(W & 0xFFF);
+        if (lo >= 2048) { hi++; lo -= 4096; }
+        if (hi > 0) {
+            p.push_back(LUI (9, (int)hi));
+            p.push_back(ADDI(9, 9, lo));
+        } else {
+            p.push_back(ADDI(9, 0, lo));
+        }
+    }
+
     // ── Lê angle_idx e carrega sin/cos ───────────────────────────────────
     p.push_back(LW  (10, 5, -1));       // a0 = VRAM[2N] = angle_idx
 
-    // ax_idx = (angle_idx * 154) >> 8  (aprox. angle * 0.6 para rot X)
-    p.push_back(ADDI(28,  0, 154));
+    // ax_idx = (angle_idx * ROT_X_RATIO) >> 8
+    p.push_back(ADDI(28,  0, ROT_X_RATIO));
     p.push_back(MUL (28, 10, 28));
     p.push_back(SRAI(28, 28,  8));      // x28 = ax_idx
 
@@ -241,23 +260,22 @@ std::vector<uint32_t> build_geometry_shader(uint32_t N, uint32_t W, uint32_t /*H
     p.push_back(ADDI(31, 31, 896));     // 24 x31 = denom = 896 + vz'
     p.push_back(DIV (10, 10, 31));      // 25 x10 = d
 
-    // sx = ((vx' * d) >> 8) * 58 >> 8 + W/2
-    // factor 58 = round(0.45 * W) = round(0.45 * 128)  [Q8.8: vx'*d já é Q8.8, *58 >>8 = pixels]
+    // sx = ((vx' * d) >> 8) * proj_W >> 8 + W/2
     p.push_back(MUL (30, 28, 10));      // 26 vx'*d
     p.push_back(SRAI(30, 30,  8));      // 27
-    p.push_back(ADDI(31,  0, 58));      // 28 0.45*128=57.6≈58
+    p.push_back(ADDI(31,  0, proj_W)); // 28
     p.push_back(MUL (30, 30, 31));      // 29
     p.push_back(SRAI(30, 30,  8));      // 30
-    p.push_back(ADDI(21, 30, 64));      // 31 x21 = sx
+    p.push_back(ADDI(21, 30, half_W)); // 31 x21 = sx
 
-    // sy = (-(vy' * d) >> 8) * 58 >> 8 + H/2
+    // sy = (-(vy' * d) >> 8) * proj_H >> 8 + H/2
     p.push_back(MUL (30, 29, 10));      // 32 vy'*d
     p.push_back(SRAI(30, 30,  8));      // 33
     p.push_back(SUB (30,  0, 30));      // 34 nega (y invertido para tela)
-    p.push_back(ADDI(31,  0, 58));      // 35
+    p.push_back(ADDI(31,  0, proj_H)); // 35
     p.push_back(MUL (30, 30, 31));      // 36
     p.push_back(SRAI(30, 30,  8));      // 37
-    p.push_back(ADDI(22, 30, 64));      // 38 x22 = sy
+    p.push_back(ADDI(22, 30, half_H)); // 38 x22 = sy
 
     // Escreve (sx, sy) em screen_verts[v*2], screen_verts[v*2+1]
     p.push_back(ADDI(31,  0,  2));      // 39
@@ -280,7 +298,7 @@ std::vector<uint32_t> build_geometry_shader(uint32_t N, uint32_t W, uint32_t /*H
 
     // ── 12 blocos Bresenham (39 insts cada) ──────────────────────────────
     for (int e = 0; e < 12; e++)
-        emit_bresenham(p, CUBE_EDGES[e][0], CUBE_EDGES[e][1]);
+        emit_bresenham(p, CUBE_EDGES[e][0], CUBE_EDGES[e][1], W, H);
 
     p.push_back(ECALL());
 

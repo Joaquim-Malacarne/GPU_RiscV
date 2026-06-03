@@ -14,11 +14,8 @@ std::vector<uint32_t> build_fragment_shader(uint32_t num_cores, uint32_t N) {
     prog.push_back(LUI (5, (int)ppc_hi));
     prog.push_back(ADDI(5, 5, ppc_lo));
 
-    // ── base_addr (t1) = mhartid × ppc  [ppc é potência de 2: usa SLL] ──
-    uint32_t shift = 0;
-    for (uint32_t tmp = ppc; tmp > 1; tmp >>= 1) shift++;
-    prog.push_back(ADDI(30, 0, (int32_t)shift)); // t5 = shift (temporário)
-    prog.push_back(SLL (6, 10, 30));              // t1 = mhartid << shift
+    // ── base_addr (t1) = mhartid × ppc (MUL: funciona para qualquer ppc) ──
+    prog.push_back(MUL(6, 10, 5));  // t1 = mhartid * ppc
 
     // ── mask_base (t2) = N via LUI + ADDI ────────────────────────────────
     uint32_t n_hi = (N >> 12) & 0xFFFFF;

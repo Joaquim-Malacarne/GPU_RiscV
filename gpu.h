@@ -3,61 +3,74 @@
 
 #include <cstdint>
 #include <vector>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include "config.h"
 #include "VRAM.h"
 #include "RV32ICore.h"
+#include "shared_frame.h"
 
 /*
- * GPUManager — pool de núcleos RV32I com dois buffers de VRAM.
+ * GPUManager — COMPUTE_THREADS threads em spin loop contínuo.
  *
- * Fluxo por frame:
- *   1. set_angle(idx)       → CPU grava angle_idx no back_buffer
- *   2. load_geometry(prog)  → carrega geometry shader só no núcleo 0
- *   3. dispatch_geometry()  → executa núcleo 0 (rotação + projeção + Bresenham)
- *   4. load_program(prog)   → carrega fragment shader em todos os núcleos
- *   5. dispatch_frame()     → executa todos os núcleos em paralelo (coloração)
- *   6. get_pixels()         → retorna front_buffer para exibição
+ * Fluxo por frame (3 fases sincronizadas por spin barriers):
+ *   Fase 0  — thread líder (t=0): grava ângulo, executa geometry shader no núcleo 0,
+ *             troca instruction_memory do núcleo 0 para fragment.
+ *   Fase 1  — todas as 7 threads: reset + execute nos núcleos atribuídos (100% CPU).
+ *   Fase 2  — thread líder: swap de buffers, publica em SharedFrame,
+ *             restaura geometry no núcleo 0 para a próxima iteração.
  *
- * Layout do back_buffer (tamanho = vl_total_size(N)):
- *   [0,  N)       → color buffer       (fragment shader escreve)
- *   [N, 2N)       → edge mask          (geometry shader escreve)
- *   [2N, 2N+553)  → dados de controle  (veja vram_layout.h)
+ * Distribuição de núcleos entre 7 threads (stride = COMPUTE_THREADS):
+ *   t0 → cores 0, 7, 14   t1 → cores 1, 8, 15   t2 → cores 2, 9
+ *   t3 → cores 3, 10       t4 → cores 4, 11       t5 → cores 5, 12
+ *   t6 → cores 6, 13
  */
 class GPUManager {
     size_t num_cores;
-    size_t total_pixels;   // N
-    int    num_threads;    // 0 = hardware_concurrency
+    size_t total_pixels;
 
     std::vector<RV32ICore> processing_units;
-    VRAM back_buffer;
-    VRAM front_buffer;
+    VRAM                   back_buffer;
+    VRAM                   front_buffer;
 
-    static void run_core(RV32ICore* core);
+    std::vector<uint32_t>  geom_prog_;
+    std::vector<uint32_t>  frag_prog_;
+
+    // ── Spin barrier ─────────────────────────────────────────────────────
+    struct SpinBarrier {
+        const int        n;
+        std::atomic<int> count{0};
+        std::atomic<int> gen{0};
+        explicit SpinBarrier(int n_) : n(n_) {}
+        void arrive_and_wait();
+    };
+
+    // 3 barreiras separadas: uma por fase (evita risco de reutilização prematura)
+    SpinBarrier barrier_geom_;  // sincroniza após geometry
+    SpinBarrier barrier_frag_;  // sincroniza após fragment
+    SpinBarrier barrier_pub_;   // sincroniza após publicação (antes da prox. iter.)
+
+    std::atomic<bool>     running_{false};
+    std::atomic<uint32_t> angle_idx_{0};
+    std::vector<std::thread> compute_threads_;
+
     void swap_buffers();
+    void worker(int t, SharedFrame& shared);
 
 public:
-    // num_threads_hint: 0 = detectar automaticamente
-    GPUManager(size_t cores_count, size_t pixels, int num_threads_hint = 0);
+    GPUManager(size_t cores, size_t pixels);
+    ~GPUManager();
 
-    // Carrega programa em todos os núcleos
-    void load_program(const std::vector<uint32_t>& prog);
-
-    // Carrega programa apenas no núcleo core_id
-    void load_geometry(const std::vector<uint32_t>& prog, size_t core_id = 0);
-
-    // Escreve angle_idx na posição 2N do back_buffer
-    void set_angle(uint32_t angle_idx);
-
-    // Despacha apenas o núcleo core_id (síncrono)
-    void dispatch_geometry(size_t core_id = 0);
-
-    // Despacha todos os núcleos em batches (paralelo)
-    void dispatch_frame();
-
-    // Retorna referência à VRAM (para inicialização externa)
     VRAM& vram() { return back_buffer; }
 
-    // Retorna front_buffer pronto para exibição
-    const std::vector<uint32_t>& get_pixels() const;
+    // Armazena programas compilados e pré-carrega nos núcleos (chamado uma vez).
+    void set_programs(const std::vector<uint32_t>& geom,
+                      const std::vector<uint32_t>& frag);
+
+    // Lança COMPUTE_THREADS threads em spin loop e bloqueia até shared.stop.
+    void run_continuous(SharedFrame& shared);
 };
 
 #endif // GPU_H

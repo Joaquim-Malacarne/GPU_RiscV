@@ -1,0 +1,15 @@
+# Binários compilados
+gpu_v
+benchmark
+teste
+
+# Objetos
+*.o
+
+# PDFs e materiais externos
+PDF/
+
+# Arquivos temporários
+*.csv
+benchmark_report.txt
+prompt_notebooklm.md

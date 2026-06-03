@@ -44,6 +44,13 @@ public:
     uint32_t get_register(int i) const { return registers[i]; }
     uint32_t get_pc() const { return pc; }
     uint32_t get_id() const { return mhartid; }
+
+    // Reinicia PC e registradores mantendo instruction_memory intacta (sem cópia).
+    void reset() {
+        pc = 0;
+        std::fill(std::begin(registers), std::end(registers), 0u);
+        registers[10] = mhartid;
+    }
 };
 
 #endif // RV32ICORE_H
