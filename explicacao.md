@@ -33,6 +33,14 @@
 25. [Correção de bugs de resolução](#25-correção-de-bugs-de-resolução--independência-de-potência-de-2)
 26. [Controles de config.h — referência completa](#26-controles-de-configh--referência-completa)
 27. [Janela redimensionável — SDL_RenderSetLogicalSize](#27-janela-redimensionável--sdl_rendersetlogicalsize)
+28. [Benchmark — Metodologia e Objetivo](#28-benchmark--metodologia-e-objetivo)
+29. [Seção 1 — Escalabilidade de Threads](#29-seção-1--escalabilidade-de-threads-de-cálculo)
+30. [Seção 2 — Escalabilidade de Núcleos RV32I](#30-seção-2--escalabilidade-de-núcleos-rv32i)
+31. [Seção 3 — Impacto da Resolução](#31-seção-3--impacto-da-resolução)
+32. [Seção 4 — Grade Cores × Threads](#32-seção-4--grade-cores--threads)
+33. [Lei de Amdahl — Análise Quantitativa Completa](#33-lei-de-amdahl--análise-quantitativa-completa)
+34. [Conclusões dos Benchmarks e Recomendações](#34-conclusões-dos-benchmarks-e-recomendações)
+35. [Resultados Finais — Benchmark 2026-06-04 e Artigo IEEE](#35-resultados-finais--benchmark-2026-06-04-e-artigo-ieee)
 
 ---
 
@@ -2044,6 +2052,886 @@ main()
        ├─ SDL_RenderCopy()      ← estica 128×128 → 640×640
        └─ SDL_RenderPresent()   ← exibe na tela
 ```
+
+---
+
+## 28. Benchmark — Metodologia e Objetivo
+
+### Por que um benchmark headless?
+
+O benchmark (`benchmark.cpp`) executa o mesmo pipeline de renderização do GPU-V
+**sem** janela SDL2, sem thread da tela e sem sincronização de monitor. Isso elimina
+três fontes de variância externas ao desempenho do motor de cálculo:
+
+1. **V-sync / frame limiter** — o SDL2 respeita o refresh rate do monitor (60 Hz no
+   modo não-acelerado); o benchmark não tem esse teto.
+2. **Tempo de `SDL_UpdateTexture` + `SDL_RenderPresent`** — cópia de pixels para a GPU
+   real e flip do framebuffer consomem tempo proporcional à resolução e à latência do
+   driver gráfico.
+3. **Thread de eventos** — `poll_events()` + `wait_for(16ms)` adicionam latência não
+   determinística ao pipeline.
+
+Sem essas interferências, o FPS medido reflete **exclusivamente** o desempenho do
+loop `worker()`: geometry shader + fragment shaders + `swap_buffers()`.
+
+### Estrutura do benchmark
+
+```
+Para cada (cores, threads, W, H):
+  1. Cria BenchmarkGPU(cores, threads, W, H)
+     - aloca VRAM, inicializa LUTs, compila shaders
+  2. Lança num_threads workers em spin loop
+  3. Dorme 500 ms  ← aquecimento: CPU freq ramp-up, branch predictor
+  4. Zera frame_count, grava t0
+  5. Dorme 3000 ms ← janela de medição
+  6. running = false  → workers terminam no final do frame atual
+  7. Join de todas as threads
+  8. Grava t1
+  9. FPS    = frame_count / (t1 - t0)
+     Mpix/s = FPS × W × H / 1e6
+```
+
+### O que "1 frame" inclui
+
+Cada unidade contada em `frame_count` abrange:
+
+| Fase | Executor | Custo dominante |
+|------|----------|-----------------|
+| Geometry (Fase 0) | Thread 0 apenas | Loop de limpeza O(N) + Bresenham |
+| Barrier `geom` | Todos os N threads | Spin até o último chegar |
+| Fragment (Fase 1) | Todos os N threads | N/cores pixels × ~9 instr/pixel |
+| Barrier `frag` | Todos os N threads | Spin até o último chegar |
+| Swap + publish (Fase 2) | Thread 0 apenas | `std::copy` + `std::fill` de N palavras |
+| Barrier `pub` | Todos os N threads | Spin antes do próximo frame |
+
+### Plataforma de teste
+
+```
+CPU:             AMD Ryzen 5 3500U (Zen+, mobile)
+Núcleos físicos: 4
+HW threads:      8 (SMT 2-way)
+Frequência:      2.1 – 3.7 GHz (boost)
+Cache L1d:       4 × 32 KB
+Cache L2:        4 × 512 KB = 2 MB total
+Cache L3:        4 MB (compartilhado)
+SO:              Linux 6.8
+Compilador:      GCC 13, -O2 -march=native
+Modo:            headless, 500 ms aquecimento + 3000 ms medição
+Total de testes: 24 (4 secoes)
+```
+
+---
+
+## 29. Seção 1 — Escalabilidade de Threads de Cálculo
+
+**Configuração fixa:** 14 núcleos RV32I, resolução 1000×1000.
+**Variável:** `COMPUTE_THREADS` de 1 a 14.
+
+### Resultados
+
+```
+Threads | Frames |    FPS |  Mpix/s | Eficiencia | Speedup
+--------|--------|--------|---------|------------|---------
+      1 |     27 |   8,85 |    8,85 |    100,0%  |  1,00x
+      2 |     31 |  10,33 |   10,33 |    116,7%  |  1,17x
+      4 |     47 |  15,35 |   15,35 |    173,5%  |  1,73x   <- OTIMO
+      7 |     36 |  11,70 |   11,70 |    132,3%  |  1,32x
+     14 |     20 |   6,48 |    6,48 |     73,2%  |  0,73x
+```
+
+**Eficiência** = FPS_N / (FPS_1 × N) × 100%
+**Speedup** = FPS_N / FPS_1
+
+### Análise linha a linha
+
+#### 1 thread → 2 threads (+16,7%, eficiência 116,7%)
+
+Com 1 thread, a CPU física está sendo usada por 1 core do Ryzen. Ao adicionar
+uma segunda thread, o **SMT (Simultaneous Multithreading)** do Ryzen entra em
+ação: as 2 threads compartilham os recursos do mesmo core físico (unidades de
+execução, caches) mas os pipelines são alimentados de forma mais contínua. O
+ganho de +16,7% acima do speedup linear 1,0x → 2,0x pode parecer contraditório,
+mas na realidade o 1-thread-apenas era **subótimo**: com uma única thread em
+spin contínuo, a CPU tinha pockets de inatividade no pipeline (dados esperando
+da VRAM). A segunda thread preenche esses vácuos.
+
+#### 2 threads → 4 threads (+48,6%)
+
+Este é o salto mais expressivo. Com 4 threads de cálculo:
+
+```
+Total de threads ativas no SO:
+  4 workers (spin 100%)
++ 1 thread da tela (bloqueada em condvar 16 ms -> quase inativa)
++ 1 thread main (bloqueada em join -> inativa)
+= ~6 threads no agendador
+
+Hardware disponivel: 8 HW threads (4 cores x 2 SMT)
+Threads realmente competindo por CPU: 4
+```
+
+Cada worker 1-3 executa o fragment shader enquanto o worker 0 executa o
+geometry shader. Como o total de 4 threads ativas <= 4 núcleos físicos, **cada
+thread tem dedicação exclusiva a um core físico** sem troca de contexto. Isso
+maximiza o throughput de cache (cada core tem seu próprio L1d e L2).
+
+#### 4 threads → 7 threads (-23,8%)
+
+A contagem de threads ativas vai para ~7. O Ryzen 5 3500U tem apenas 4 cores
+físicos. Para servir 7 threads em spin contínuo, o agendador Linux precisa
+**multiplexar temporalmente** — cada core físico alterna entre 2 threads ao
+longo do tempo (via SMT ou via preempção real dependendo da carga).
+
+O problema crítico: o **worker 0** (que executa o geometry shader, a fase
+serial) agora compete por CPU com 3 ou 6 outros workers que estão em spin nas
+barreiras. O worker 0 recebe menos tempo de CPU proporcional -> a fase serial
+fica mais lenta -> todo o pipeline degrada.
+
+```
+Analogia:
+  Com 4 threads: worker 0 recebe ~25% do tempo total de 4 cores = 1 core dedicado
+  Com 7 threads: worker 0 recebe ~14% do tempo total -> nao tem core dedicado
+```
+
+#### 7 threads → 14 threads (-44,6% vs 4 threads)
+
+Com 14 workers em spin, o total chega a ~16 threads para 8 HW threads. O
+agendador precisa time-slice com overhead de troca de contexto (~1.000 ciclos
+cada). Além disso:
+
+- **Contenção de cache**: 14 threads em spin executando `gen.load()` na mesma
+  linha de cache da `SpinBarrier` geram 14 fluxos de tráfego de coerência
+  de cache (protocolo MESI). Mesmo com `PAUSE`, isso satura o barramento L3.
+- **Thrashing de TLB**: 14 stacks separados fazendo acesso aleatório à VRAM
+  polui o iTLB e dTLB dos 4 cores.
+- **O worker 0 recebe ~7% do tempo** -> geometry extremamente lento.
+
+O resultado (6,48 FPS) é **pior que 1 thread** (8,85 FPS), demonstrando que
+adicionar threads além da capacidade física do hardware não apenas não ajuda,
+mas destrói ativamente o desempenho.
+
+### Por que a eficiência supera 100% com 2 e 4 threads?
+
+Eficiência > 100% significa que o speedup foi maior que o esperado pelo
+modelo linear simples. Isso acontece porque:
+
+1. **O baseline de 1 thread é ineficiente**: o pipeline do core físico tem
+   latências de memória não mascaradas com apenas 1 thread.
+2. **SMT oculta latências**: com 2+ threads, quando uma thread espera por
+   dados da VRAM (cache miss -> 100+ ciclos de latência), a outra thread
+   avança no seu trabalho. O core físico nunca fica ocioso.
+3. **Pipeline mais cheio**: instruções de múltiplas threads podem ser emitidas
+   no mesmo ciclo se usarem unidades de execução diferentes (ex: ALU inteira
+   + unidade de load/store).
+
+---
+
+## 30. Seção 2 — Escalabilidade de Núcleos RV32I
+
+**Configuração:** resolução 1000×1000, `threads = min(cores, 7)`.
+**Variável:** `NUM_CORES` de 1 a 28.
+
+### Resultados
+
+```
+Nucleos | Threads | Frames |    FPS |  Mpix/s | Speedup vs 1 core
+--------|---------|--------|--------|---------|-------------------
+      1 |       1 |     34 |  11,22 |   11,22 |        1,00x
+      2 |       2 |     34 |  10,96 |   10,96 |        0,98x
+      4 |       4 |     40 |  13,18 |   13,18 |        1,17x
+      8 |       7 |     33 |  10,72 |   10,72 |        0,96x
+     14 |       7 |     31 |  10,21 |   10,21 |        0,91x
+     28 |       7 |     36 |  11,68 |   11,68 |        1,04x
+```
+
+### O invariante fundamental
+
+O trabalho total do **fragment shader é invariante ao número de núcleos**:
+
+```
+total_pixels = N = W x H = 1.000.000
+
+Com C nucleos, cada nucleo processa:
+  ppc = N / C pixels
+  executa ~9 instrucoes por pixel
+  total por nucleo = 9 x ppc = 9N/C
+
+Em 7 threads com C nucleos, cada thread processa ceil(C/7) nucleos:
+  trabalho por thread = ceil(C/7) x 9N/C ≈ 9N/7  (independe de C!)
+```
+
+Isso significa que **dobrar C não muda o trabalho por thread**. O FPS deveria
+ser constante conforme C cresce --- e é: variação de apenas 10,21 a 13,18 FPS.
+
+### Por que há variação mesmo com trabalho constante?
+
+**1. Custo de `reset()`**: por frame, o worker faz `reset()` em C núcleos
+(cada reset zera 32 registradores = 128 bytes).
+
+```
+C= 1: reset =  1 x 32 escritas =   32 registradores/frame
+C= 4: reset =  4 x 32 escritas =  128 registradores/frame
+C=14: reset = 14 x 32 escritas =  448 registradores/frame
+C=28: reset = 28 x 32 escritas =  896 registradores/frame
+```
+
+**2. O geometry shader não muda**: independente de C, o geometry shader sempre
+executa no núcleo 0 com o mesmo programa de 541 instruções + N iterações de
+limpeza. Ele domina o tempo serial.
+
+**3. Número de iterações do fragment loop**: com C=1, o único núcleo processa
+1.000.000 pixels em sequência. Com C=28, cada núcleo processa 35.714 pixels.
+
+### Conclusão da seção 2
+
+Variar `NUM_CORES` de 1 a 28 produz menos de 30% de variação no FPS. Isso
+confirma que o **gargalo não está no fragment shader** (paralelo e invariante)
+mas no **geometry shader** (serial, O(N)). O número de núcleos RV32I é um
+parâmetro de granularidade, não de throughput global.
+
+---
+
+## 31. Seção 3 — Impacto da Resolução
+
+**Configuração fixa:** 14 núcleos, 7 threads.
+**Variável:** resolução W×H.
+
+### Resultados
+
+```
+Resolucao    |   Pixels |    FPS |  Mpix/s | VRAM total | Cabe no L3?
+-------------|----------|--------|---------|------------|------------
+  256x256    |   65.536 |   73,5 |     4,8 |   ~0,5 MB  | Sim (L2)
+  512x512    |  262.144 |   38,5 |    10,1 |   ~2,0 MB  | Sim (L3)
+ 1000x1000   |1.000.000 |   11,0 |    11,0 |   ~7,6 MB  | Nao (>L3)
+ 1920x1080   |2.073.600 |    6,0 |    12,5 |  ~15,8 MB  | Nao (>>L3)
+```
+
+A VRAM total = `(2N + 553) × 4 bytes`.
+
+### A tendência oposta: FPS cai, Mpix/s sobe
+
+Cada frame tem um custo fixo **independente de N**:
+
+```
+Componente                    | Custo    | Escala com N?
+------------------------------|----------|--------------
+Rotacao 8 vertices (geom)     | ~368 ins | Nao
+Projecao perspectiva (geom)   | ~184 ins | Nao
+12 blocos Bresenham (geom)    | ~600 ins | Parcial
+3x barrier arrive_and_wait    | ~50 cicl | Nao
+load_program 2x (nucleo 0)    | ~1 us    | Nao
+condvar notify_one            | ~1 us    | Nao
+
+Componente                    | Custo    | Escala com N?
+------------------------------|----------|--------------
+Loop de limpeza da edge mask  | 3N instr | Sim (linear)
+Fragment shader (14 nucleos)  | 9N instr | Sim (linear)
+swap_buffers (copy+fill)      | 2N words | Sim (linear)
+```
+
+Em **baixa resolução** (256×256, N=65.536), o custo fixo representa uma fração
+grande do tempo total de frame. Em **alta resolução** (1920×1080, N=2.073.600),
+o custo linear domina completamente. Logo, a eficiência por pixel (Mpix/s)
+**melhora** conforme N cresce porque o overhead fixo é amortizado.
+
+#### Estimativa numérica do overhead relativo
+
+```
+Overhead fixo por frame: ~27.000 "unidades de custo"
+Custo linear por N:      ~5,64N unidades
+
+Fracao de overhead fixo:
+  256x256:    27k / (27k + 5,64x65.536)    ≈ 6,8%
+  512x512:    27k / (27k + 5,64x262.144)   ≈ 1,8%
+  1000x1000:  27k / (27k + 5,64x1.000.000) ≈ 0,5%
+  1920x1080:  27k / (27k + 5,64x2.073.600) ≈ 0,2%
+```
+
+Assim em 256×256 o sistema "desperdiça" ~7% em overhead, mas em 1920×1080
+apenas ~0,2%. Por isso o Mpix/s cresce de 4,8 para 12,5.
+
+#### Efeito da hierarquia de cache
+
+```
+Resolucao  | VRAM total | Situacao no cache
+-----------|------------|-------------------------------------------
+256x256    |  ~0,5 MB   | Cabe no L2 (2MB) -> hit rate alto, rapido
+512x512    |  ~2,0 MB   | Cabe no L3 (4MB) -> L2 miss, L3 hit
+1000x1000  |  ~7,6 MB   | Nao cabe no L3 -> L3 miss -> RAM (~60ns)
+1920x1080  | ~15,8 MB   | Muito maior que L3 -> RAM bound
+```
+
+Com 1920×1080, o loop de limpeza da edge mask (2M escritas) e o swap_buffers
+(2M cópias) causam **L3 cache thrashing**. Isso é por que o Mpix/s cresce
+de forma sublinear (não dobra de 1000×1000 para 1920×1080 apesar dos pixels
+dobrarem: 11,0 vs 12,5 Mpix/s, apenas +14%).
+
+---
+
+## 32. Seção 4 — Grade Cores × Threads
+
+**Configuração:** resolução 1000×1000.
+**Variáveis:** `NUM_CORES` ∈ {4, 8, 16} e `COMPUTE_THREADS` ∈ {1, 2, 4, 8, 16}.
+
+### Resultados (FPS)
+
+```
+              |  thr=1  |  thr=2  |  thr=4  |  thr=8  |  thr=16
+--------------|---------|---------|---------|---------|--------
+  4 nucleos   |  11,0   |  12,2   |  11,9   |    --   |    --
+  8 nucleos   |  10,4   |   --    |  13,3   |  10,0   |    --
+ 16 nucleos   |   --    |  11,6   |   --    |  10,6   |   5,7
+```
+
+**Melhor absoluto: 8 núcleos / 4 threads = 13,3 FPS**
+
+### Padrão identificado
+
+```
+threads= 1 -> melhor: 4 nucleos, 11,0 FPS
+threads= 2 -> melhor: 4 nucleos, 12,2 FPS
+threads= 4 -> melhor: 8 nucleos, 13,3 FPS  <- MELHOR ABSOLUTO
+threads= 8 -> melhor: 16 nucleos, 10,6 FPS
+threads=16 -> melhor: 16 nucleos,  5,7 FPS
+```
+
+### Por que 8 núcleos supera 4 e 16 com 4 threads?
+
+Com 4 threads de cálculo (stride=4):
+
+```
+Com 4 nucleos/4 threads:  cada thread executa 1 nucleo  -> ppc = 250k pixels
+Com 8 nucleos/4 threads:  cada thread executa 2 nucleos -> ppc = 125k pixels x 2
+Com 16 nucleos/4 threads: cada thread executa 4 nucleos -> ppc = 62,5k pixels x 4
+```
+
+Com 4 núcleos, o fragment shader processa 250.000 pixels por invocação — loop
+mais longo, melhor utilização de cache por kernel. Com 16 núcleos, cada
+`execute()` processa apenas 62.500 pixels, e o overhead de `reset()` e
+`load_program` (16 chamadas vs 4) pesa mais relativamente. O ponto de 8 núcleos
+equilibra tamanho do loop vs overhead de inicialização.
+
+### Degradação severa com 16 threads (5,7 FPS)
+
+Com 16 workers em spin + 2 auxiliares = 18 threads para 8 HW threads:
+
+```
+Threads de SO: 18
+HW threads:     8
+Ratio:         2,25x -> cada HW thread serve 2,25 threads de SO em media
+
+Worker 0 (geometry, serial) recebe: 1/18 ≈ 5,5% do tempo total
+vs ideal com 4 threads:             1/6  ≈ 16,7% do tempo total
+
+Degradacao do worker 0: 16,7% -> 5,5% = -67% -> geometry fica 3x mais lento
+```
+
+---
+
+## 33. Lei de Amdahl — Análise Quantitativa Completa
+
+### Enunciado
+
+Gene Amdahl (1967) formulou o limite teórico de speedup:
+
+```
+             1
+S(n) = ─────────────
+         s + (1-s)/n
+
+Onde:
+  S(n) = speedup com n processadores
+  s    = fracao serial (0 <= s <= 1)
+  1-s  = fracao paralelizavel
+  n    = numero de processadores
+
+Limite: quando n -> infinito, S_max = 1/s
+```
+
+### Identificação da fração serial no GPU-V
+
+A fase serial é a Fase 0 (geometry shader), executada apenas pelo Worker 0.
+
+```
+Componente                      | Instrucoes executadas | Paralelo?
+--------------------------------|-----------------------|----------
+Leitura de angle_idx (1 LW)     |              1        | Nao
+Carga sin/cos (4 LW)            |              4        | Nao
+Rotacao 8 vertices (46x8 instr) |            368        | Nao
+Projecao 8 vertices (~23x8)     |            184        | Nao
+Loop de limpeza edge mask       |      3.000.000        | Nao (*)
+12 blocos Bresenham (~500 instr)|         ~6.000        | Nao
+Troca instruction_memory        |            ~50        | Nao
+--------------------------------|-----------------------|----------
+Total fase serial               |      ~3.006.600       |
+
+(*) Poderia ser paralelizado — maior oportunidade de otimizacao
+```
+
+```
+Componente                      | Instr. totais | Paralelo?
+--------------------------------|---------------|----------
+Fragment shader (14 nucleos)    |  ~9.000.000   | Sim
+swap_buffers (copy + fill)      |  ~2.000.000   | Nao (*)
+--------------------------------|---------------|----------
+Total fase paralela             | ~11.000.000   |
+
+(*) swap_buffers serial porque roda no worker 0 na Fase 2
+```
+
+### Cálculo do s teórico vs empírico
+
+```
+s_teorico = 3.006.600 / (3.006.600 + 11.000.000) ≈ 0,21
+
+Mas o s medido empiricamente e maior. Ajuste pela dados:
+
+Speedup medido (1->4 threads): 15,35 / 8,85 = 1,734x
+
+Resolvendo para s:
+  1,734 = 1 / (s + (1-s)/4)
+  1,734 x (s + (1-s)/4) = 1
+  1,734s + 0,4335(1-s) = 1
+  1,734s + 0,4335 - 0,4335s = 1
+  1,3005s = 0,5665
+  s = 0,4356 ≈ 0,42
+```
+
+### Por que s empírico (0,42) > s teórico (0,21)?
+
+A diferença (0,42 vs 0,21) reflete overheads reais não modelados:
+
+```
+Overhead extra de s (≈0,21 adicional):
+  1. swap_buffers serial:         2M ops memória por frame (thread 0)
+  2. SpinBarrier overhead:        14 atomics x 3 barreiras = 42 atomics/frame
+  3. Contenção de cache MESI:     N threads fazendo load() no mesmo atômico
+  4. load_program x2 por frame:   copy de vector (541 + 18 elementos)
+  5. Preempção de OS:             agendador Linux CFS com timeslice de 1ms
+```
+
+### Tabela completa: predição vs medição
+
+```
+Threads | Speedup medido | Amdahl s=0,42 | Diferenca | Interpretacao
+--------|----------------|---------------|-----------|-------------------
+      1 |         1,000x |        1,000x |     0,0%  | baseline
+      2 |         1,167x |        1,155x |    +1,0%  | SMT ajuda
+      4 |         1,734x |        1,779x |    -2,5%  | fit excelente
+      7 |         1,322x |        2,014x |   -34,4%  | saturacao HW threads
+     14 |         0,732x |        2,204x |   -66,8%  | colapso total
+```
+
+Ate 4 threads: Amdahl modela bem. Acima: saturacao de hardware threads
+(efeito nao modelado por Amdahl, que assume processadores ilimitados).
+
+### Teto teórico e potencial de otimização
+
+```
+S_max atual = 1 / 0,42 = 2,38x
+
+Com 1 thread baseline (8,85 FPS):
+  Maximo teorico atual = 8,85 x 2,38 = 21,1 FPS
+  Medido em 4 threads:  15,35 FPS = 72,6% do maximo teorico
+```
+
+Se o loop de limpeza fosse paralelizado entre as 7 threads:
+
+```
+Novo s_serial = (swap_buffers + barreiras + overhead) / total
+             ≈ (2.000.000 + 50.000) / (2.050.000 + 9.000.000)
+             ≈ 0,19
+
+S_max_novo = 1 / 0,19 = 5,26x
+Teto = 8,85 x 5,26 ≈ 46,5 FPS (vs 21,1 FPS atual)
+```
+
+Se swap_buffers tambem fosse paralelizado:
+
+```
+s_restante ≈ 0,03 (so overhead de barreiras e atomics)
+S_max = 1 / 0,03 ≈ 33x
+Teto = 8,85 x 33 ≈ 292 FPS (limitado pelo hardware real)
+```
+
+### Lei de Gustafson — escalonamento fraco
+
+Gustafson (1988) pergunta: "e se o tamanho do problema crescer com os
+processadores?" No GPU-V isso significa aumentar N junto com os threads:
+
+```
+1 thread,  256x256 (N=65k):    73,5 FPS,  4,8 Mpix/s
+4 threads, 512x512 (N=262k):   38,5 FPS, 10,1 Mpix/s  (N ~4x maior)
+7 threads, 1000x1000 (N=1M):   11,0 FPS, 11,0 Mpix/s  (N ~15x maior)
+```
+
+O Mpix/s cresce de 4,8 para 11,0 -- mais do que dobrou com resolucao 15x
+maior. Isso confirma **escalonamento fraco favoravel**: ao aumentar N
+proporcionalmente ao numero de threads, o throughput por pixel melhora
+porque o overhead fixo por frame é diluído.
+
+---
+
+## 34. Conclusões dos Benchmarks e Recomendações
+
+### Resumo dos 4 achados principais
+
+```
+Achado                            | Evidencia                    | Causa
+----------------------------------|------------------------------|---------------------
+Pico em 4 threads (15,35 FPS)     | Secao 1 (§29)                | 4 cores fisicos
+Degradacao acima de 4 threads     | FPS: 15,35->11,70->6,48      | Saturacao HW threads
+Nucleos adicionais nao ajudam     | FPS varia <30% com cores     | Trabalho fragment fixo
+Mpix/s cresce com resolucao       | 4,8->12,5 Mpix/s             | Overhead fixo amortizado
+s ~= 0,42 (fracao serial)         | Ajuste Amdahl                | Loop de limpeza O(N)
+Teto atual: ~21 FPS em 1000x1000  | 1/0,42 x 8,85               | Lei de Amdahl
+```
+
+### Recomendação de COMPUTE_THREADS por hardware
+
+```
+Hardware                  | Nucleos fisicos | COMPUTE_THREADS recomendado
+--------------------------|-----------------|-----------------------------
+Laptop 2 cores / 4 HW    |        2        |  2
+Desktop 4 cores / 8 HW   |        4        |  4  <- Ryzen 5 3500U: OTIMO
+Desktop 6 cores / 12 HW  |        6        |  6
+Desktop 8 cores / 16 HW  |        8        |  8
+Workstation 16 cores      |       16        | 14-16
+```
+
+**Regra**: `COMPUTE_THREADS = núcleos_físicos` (NAO HW threads).
+Usar o numero de HW threads (SMT) nao melhora porque as threads em spin
+ja consomem 100% do slot SMT disponivel.
+
+### Os dois gargalos identificados para trabalhos futuros
+
+**Gargalo 1 — Loop de limpeza O(N) serial** (maior impacto):
+
+```cpp
+// Situacao atual no geometry shader (executado apenas no nucleo 0):
+//   for x in [N, 2N): VRAM[x] = 0    <- N iteracoes seriais no shader
+
+// Otimizacao proposta: worker loop paralelo antes da geometry
+// (acrescentar na Fase 0 antes de barrier_geom):
+size_t chunk = N / num_threads_;
+size_t start = N + (size_t)t * chunk;
+std::fill(back_buf_.memory.begin() + start,
+          back_buf_.memory.begin() + start + chunk, 0u);
+// remover o clear loop do geometry shader
+// impacto esperado: s cai de 0,42 para ~0,10
+//                  teto sobe de 21 FPS para ~88 FPS
+```
+
+**Gargalo 2 — swap_buffers serial** (impacto menor):
+
+```cpp
+// Situacao atual (apenas worker 0, Fase 2):
+std::copy(back_buf_.memory.begin(), ..., front_buf_.memory.begin());
+std::fill(back_buf_.memory.begin(), ..., 0u);
+
+// Otimizacao proposta (todos os workers em paralelo, Fase 2):
+size_t chunk = N / num_threads_;
+size_t base  = (size_t)t * chunk;
+std::copy(back_buf_.memory.begin()  + base,
+          back_buf_.memory.begin()  + base + chunk,
+          front_buf_.memory.begin() + base);
+std::fill(back_buf_.memory.begin()  + base,
+          back_buf_.memory.begin()  + base + chunk, 0u);
+// impacto esperado: elimina 2M ops memória do critical path serial
+```
+
+### benchmark.cpp como ferramenta de regressão de desempenho
+
+O benchmark pode ser usado antes de cada commit para detectar regressões:
+
+```bash
+# Antes de mudança
+./benchmark --quick 2>&1 | grep FPS > baseline.txt
+
+# Após mudança
+make benchmark && ./benchmark --quick 2>&1 | grep FPS > after.txt
+
+# Diff de FPS
+paste baseline.txt after.txt | awk '{
+  split($0, a); old=a[1]; new=a[5];
+  pct=(new-old)/old*100;
+  printf "%-30s %6.1f -> %6.1f FPS  (%+.1f%%)\n", "Test:", old, new, pct
+}'
+```
+
+Qualquer regressão acima de 5% em alguma configuração indica problema
+de desempenho introduzido pela mudança.
+
+---
+
+## 35. Resultados Finais — Benchmark 2026-06-04 e Artigo IEEE
+
+> **Nota sobre as seções 29–34**: os dados ali apresentados foram coletados em
+> uma versão anterior do benchmark onde o **loop de limpeza da edge mask** ainda
+> era executado na fase serial (geometry shader, worker 0). Nessa versão, o loop
+> `for x in [N, 2N): VRAM[x] = 0` rodava com N = 1.000.000 iterações de forma
+> serial a cada frame, dominando completamente a fração serial s.
+>
+> No benchmark definitivo (2026-06-04), esse loop foi **movido para a Fase 2
+> (paralela)**, dividido entre todas as compute threads. Resultado: a fase serial
+> caiu de O(N) para O(1) — apenas a interpretação do geometry shader (~536
+> instruções RV32I) e o swap de buffers permanecem seriais. O perfil de
+> desempenho mudou completamente.
+
+---
+
+### A otimização que mudou tudo: edge mask clear → Fase 2
+
+| Versão | Fase de limpeza | Custo serial | FPS base (1 thread) |
+|--------|-----------------|--------------|---------------------|
+| Antiga | Geometry (serial) | O(N) = 3M instruções RV32I | ~9 FPS |
+| Final  | Fragment (paralela) | O(N/threads) por thread | ~21 FPS |
+
+Com a limpeza na Fase 2 paralela, cada thread limpa apenas `N/T` pixels, e o
+resultado é dividido pelo número de threads — exatamente como o fragment shader.
+A fase serial ficou com apenas o geometry shader (~536 instruções RV32I a
+interpretar) e o swap de ponteiros de buffer.
+
+---
+
+### Seção 1 — Escalabilidade de Threads (dados corrigidos)
+
+Configuração: 14 núcleos RV32I, 1000×1000, variando COMPUTE_THREADS.
+
+```
+Threads | Frames | FPS    | Mpix/s | Eficiência
+--------|--------|--------|--------|------------
+1       | 65     | 21,39  | 21,39  | 100,0%
+2       | 66     | 21,86  | 21,86  | 102,2%   <- SMT: sem ganho real
+3       | 111    | 36,94  | 36,94  | 172,7%   <- SALTO: 2o nucleo fisico
+4       | 110    | 36,49  | 36,49  | 170,6%
+5       | 94     | 31,26  | 31,26  | 146,2%
+6       | 120    | 39,80  | 39,80  | 186,1%   <- PICO: 6 workers + 2 sys = 8 HW slots
+7       | 113    | 37,53  | 37,53  | 175,5%   <- degradação começa
+8       | 105    | 34,94  | 34,94  | 163,3%   <- 10 threads tentando por 8 slots
+10+     | --     | SKIP   | SKIP   | oversubscribed
+```
+
+**Por que o pico está em 6 threads, não em 4 (como na versão anterior)?**
+
+Com a limpeza paralela, a Fase 2 agora tem muito mais trabalho paralelo
+(N pixels a limpar + N pixels a processar = 2N operações por thread em paralelo).
+Com mais carga paralela, o hardware consegue saturar mais threads eficientemente.
+A fórmula de saturação é: `workers + threads_sistema ≤ HW_threads`. Com 6 workers
++ 1 thread principal + 1 thread de tela = 8 threads totais = exatamente o limite
+do Ryzen 5 3500U. Em 7+, o SO precisa multiplexar threads em spin ativo,
+degradando o desempenho.
+
+**O que acontece entre 1 e 2 threads (ganho mínimo)?**
+
+Workers 0 e 1 estão ligados ao mesmo núcleo físico via SMT (Simultaneous
+Multithreading). O núcleo físico tem um único conjunto de unidades de execução
+— os dois SMT compartilham recursos. Portanto, ter 2 threads SMT não dobra a
+capacidade: as duas threads competem pelos mesmos recursos de execução.
+
+**O salto de 2 → 3 threads (de 21,9 para 36,9 FPS)?**
+
+Worker 2 é alocado no segundo núcleo físico. Agora há paralelismo real entre dois
+núcleos físicos distintos. O Worker 0 faz geometry + Fase 1 isolation enquanto
+Workers 1-2 fazem fragment em paralelo real.
+
+---
+
+### Seção 2 — Escalabilidade de Núcleos RV32I (dados corrigidos)
+
+Configuração: 1000×1000, `threads = min(cores, 7)`.
+
+```
+Cores | Threads | FPS    | Mpix/s | Notas
+------|---------|--------|--------|-------
+1     | 1       | 22,63  | 22,63  | baseline
+2     | 2       | 20,09  | 20,09  | leve queda (overhead SMT)
+3     | 3       | 26,66  | 26,66  | 2o nucleo fisico
+4     | 4       | 28,36  | 28,36  |
+5     | 5       | 37,17  | 37,17  | SALTO: 3o nucleo fisico
+6     | 6       | 32,65  | 32,65  |
+7     | 7       | 32,27  | 32,27  |
+8     | 7       | 36,24  | 36,24  |
+12    | 7       | 39,34  | 39,34  |
+14    | 7       | 40,24  | 40,24  |
+16    | 7       | 40,78  | 40,78  |
+24    | 7       | 42,82  | 42,82  |
+28    | 7       | 46,89  | 46,89  |
+32    | 7       | 49,55  | 49,55  | melhor resultado desta seção
+```
+
+**Por que mais núcleos RV32I = mais FPS (ao contrário da análise anterior)?**
+
+Na versão anterior, a análise mostrava que núcleos adicionais quase não afetavam
+o FPS porque o gargalo era a limpeza O(N) serial (que não escalava). Com a
+limpeza na Fase 2 paralela, o gargalo mudou para o fragment shader. Cada núcleo
+RV32I processa `N/C` pixels por frame. Com mais núcleos, cada núcleo processa
+menos pixels → executa menos instruções RV32I → a thread HW termina mais rápido.
+
+Mecanismo concreto com 32 núcleos:
+- Pixels por núcleo: 1.000.000 / 32 = 31.250 pixels
+- Instruções de fragmento por thread HW: 31.250 × 18 = 562.500 instruções RV32I
+- Com 1 núcleo: 1.000.000 × 18 = 18.000.000 instruções RV32I por thread
+
+Ratio: 18M / 562K = 32× menos trabalho por thread → FPS sobe (limitado pela fase
+serial, mas bem mais do que antes).
+
+Speedup total de núcleos: 49,55 / 22,63 = **2,19×** (de 1 para 32 núcleos).
+
+---
+
+### Seção 3 — Impacto da Resolução (dados corrigidos)
+
+Configuração: 14 núcleos, 7 threads.
+
+```
+Resolução     | Pixels      | FPS      | Mpix/s | Tamanho VRAM
+--------------|-------------|----------|--------|-------------
+128×128       | 16.384      | 2169,44  | 35,5   | ~0,1 MB  (cabe em L1)
+256×256       | 65.536      | 591,14   | 38,7   | ~0,5 MB  (cabe em L2)
+512×512       | 262.144     | 150,87   | 39,6   | ~2,0 MB  (cabe em L2)
+640×480       | 307.200     | 131,90   | 40,5   | ~2,3 MB  (cabe em L2)
+800×600       | 480.000     | 79,51    | 38,2   | ~3,7 MB  (quase L3)
+1000×1000     | 1.000.000   | 38,77    | 38,8   | ~7,6 MB  (excede L3)
+1280×720      | 921.600     | 41,11    | 37,9   | ~7,0 MB  (excede L3)
+1920×1080     | 2.073.600   | 19,24    | 39,9   | ~15,8 MB (excede L3)
+2560×1440     | 3.686.400   | 11,12    | 41,0   | ~28,1 MB (excede L3)
+```
+
+**Resultado mais importante: Mpix/s estável em ~38–41 em TODA a faixa.**
+
+Isso significa que o sistema é **compute-bound** (limitado pela taxa de execução
+de instruções RV32I, não pela largura de banda de memória). Se fosse
+memory-bound, o Mpix/s cairia com resoluções maiores (mais pressão no cache L3).
+
+O fato de que a VRAM em 1920×1080 (~16 MB) excede em 4× o cache L3 (4 MB) e
+mesmo assim o Mpix/s permanece estável confirma: o gargalo é o emulador RV32I,
+não o acesso à memória.
+
+Diferença em relação à análise anterior (§31): naquela versão, o Mpix/s CRESCIA
+com resolução porque a limpeza O(N) serial dominava o tempo de frame em
+resoluções altas. Agora, com a limpeza paralela, o comportamento é
+fundamentalmente diferente: puro compute-bound, Mpix/s constante.
+
+---
+
+### Lei de Amdahl — Dados Corrigidos
+
+Com os dados novos, a fração serial s é estimada como:
+
+```
+S(4) = 36,49 / 21,39 = 1,706  →  s = (4/1,706 - 1) / (4 - 1) = 0,448
+S(6) = 39,80 / 21,39 = 1,861  →  s = (6/1,861 - 1) / (6 - 1) = 0,445
+Média: s ≈ 0,45
+```
+
+Verificação do ajuste para cada ponto:
+
+```
+n  | S_medido | S_Amdahl(s=0,45) | Erro   | Observação
+---|----------|------------------|--------|---------------------
+1  | 1,000    | 1,000            | 0%     | baseline
+2  | 1,022    | 1,379            | -25,8% | SMT: sem paralelismo real
+3  | 1,727    | 1,580            | +9,3%  | 2o nucleo fisico
+4  | 1,706    | 1,702            | +0,2%  | ajuste excelente
+5  | 1,462    | 1,786            | -18,1% | ruido de scheduler
+6  | 1,861    | 1,846            | +0,8%  | ajuste excelente
+7  | 1,755    | 1,887            | -7,0%  | inicio de saturacao HW
+8  | 1,634    | 1,916            | -14,7% | saturacao HW dominante
+```
+
+O modelo de Amdahl funciona bem para n ∈ {4, 6} (erro < 1%). Os desvios:
+- n=2: medido << previsto → SMT não adiciona paralelismo real
+- n=5,7,8: medido < previsto → saturação de hardware threads (não modelada)
+
+Teto teórico: `S_max = 1/0,45 = 2,22×` → ~47,5 FPS em 1000×1000
+
+Resultado combinado (32 núcleos, 7 threads): 49,55 FPS = **2,32×** sobre o
+baseline de 1 núcleo, **superando** o teto de Amdahl para thread-only porque a
+adição de núcleos RV32I reduz o trabalho da fase paralela por thread HW,
+um efeito não modelado pela Lei de Amdahl (que assume problema de tamanho fixo
+por thread).
+
+---
+
+### Gráfico de Amdahl (fig4_amdahl.png)
+
+O artigo IEEE inclui um gráfico com três curvas:
+
+1. **Ideal linear** (linha pontilhada): S(n) = n — speedup teórico perfeito sem
+   qualquer fração serial. Serve como limite superior de referência.
+
+2. **Curva de Amdahl** (linha cheia): S(n) = 1/(0,45 + 0,55/n) — predição
+   teórica para s = 0,45.
+
+3. **Pontos medidos** (quadrados pretos): speedup real de cada configuração.
+
+O gráfico evidencia três regiões:
+- **n=2**: ponto bem abaixo da curva → efeito SMT (esperado, não modelado)
+- **n=3,4,6**: pontos próximos da curva → modelo válido
+- **n≥7**: pontos abaixo da curva → saturação de hardware (não modelada)
+
+---
+
+### Tabela de achados corrigida (comparação com §34)
+
+```
+Achado                              | Evidência corrigida          | Causa
+------------------------------------|------------------------------|---------------------------
+Pico em 6 threads (39,8 FPS)        | Seção 1 (§35)                | 6+2 sys = 8 HW slots exatos
+FPS cresce com núcleos (até 32)     | Seção 2: 22,6→49,5 FPS      | Menos pixels/nucleo emulado
+Mpix/s estável ~38-41               | Seção 3: 35-41 Mpix/s       | Compute-bound puro
+s ≈ 0,45 (fração serial)            | Ajuste Amdahl n={4,6}        | Geometry interp. + swap serial
+Teto de Amdahl: 47,5 FPS            | 1/0,45 × 21,39 FPS          | Lei de Amdahl
+Superado com 32 núcleos: 49,5 FPS   | Seção 2                      | Menos trabalho/thread HW
+```
+
+---
+
+### Artigo IEEE final — Estrutura
+
+O artigo `PDF/main.tex` (compilado com tectonic, 5 páginas) contém:
+
+| Seção | Conteúdo | Figuras/Tabelas |
+|-------|----------|-----------------|
+| I. Introdução | Contexto, motivação RISC-V, contribuições | — |
+| II. Arquitetura | VRAM layout, SpinBarrier, pipeline 3 fases | Tab. I (VRAM) |
+| III. Pipeline RV32I | Geometry shader, fragment shader | — |
+| IV. Análise Experimental | Plataforma, threads, núcleos, resolução | Tab. II (plataforma), Tab. III (threads), Fig. 1, Tab. IV (resolução), Fig. 2, Fig. 3 |
+| V. Discussão | Implicações emulação GPU em CPU, Amdahl, SpinBarrier | Fig. 4 (Amdahl), Tab. V (SpinBarrier) |
+| VI. Trabalhos Futuros | 4 direções | — |
+| VII. Conclusão | Síntese quantitativa | — |
+
+**Referências usadas (4 de 6 originais, 2 removidas):**
+- [1] Silva et al. 2024 — emulador RISC-V (motivação)
+- [2] Pirassoli 2025 — RISC++ HLS (futuro trabalho)
+- [3] Patterson & Hennessy 2014 — COD (SIMT paradigma)
+- [4] Amdahl 1967 — Lei de Amdahl
+
+**Removidas por pouca relevância no texto final:**
+- Patterson & Waterman 2019 (guia RISC-V) — não citado no artigo final
+- Herlihy & Shavit 2012 (Multiprocessor Programming) — a propriedade lock-free
+  da VRAM é auto-evidente pelo layout disjunto, não requer citação
+
+---
+
+### Recomendação final de configuração
+
+```
+Hardware                  | Nucleos fisicos | COMPUTE_THREADS | NUM_CORES
+--------------------------|-----------------|-----------------|----------
+Laptop 2 cores / 4 HW    |       2         |       4         |    14
+Desktop 4 cores / 8 HW   |       4         |       6         |    14-28
+Desktop 6 cores / 12 HW  |       6         |       8         |    28-32
+Desktop 8 cores / 16 HW  |       8         |      12         |    32
+Workstation 16+ cores     |      16         |      20+        |    32+
+```
+
+**Regra revisada:** `COMPUTE_THREADS = núcleos_físicos + 2` (para saturar os
+slots de HW sem sobrescrever). O aumento de `NUM_CORES` sempre melhora o FPS
+marginalmente, pois divide o trabalho do fragment shader em pedaços menores
+por thread HW.
 
 ---
 

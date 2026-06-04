@@ -85,23 +85,20 @@ class BenchmarkGPU {
     std::vector<RV32ICore>   cores_;
     std::vector<uint32_t>    geom_prog_, frag_prog_;
 
-    SpinBarrier bar_geom_, bar_frag_, bar_pub_;
+    SpinBarrier bar_geom_, bar_frag_, bar_pub_, bar_pub2_;
 
     std::atomic<bool>        running_{false};
+    std::atomic<bool>        stop_requested_{false};
     std::atomic<uint64_t>    frame_count_{0};
     std::atomic<uint32_t>    angle_idx_{0};
     std::vector<std::thread> workers_;
 
-    void swap_buffers() {
-        std::copy(back_buf_.memory.begin(),
-                  back_buf_.memory.begin() + (ptrdiff_t)total_pixels_,
-                  front_buf_.memory.begin());
-        std::fill(back_buf_.memory.begin(),
-                  back_buf_.memory.begin() + (ptrdiff_t)total_pixels_, 0u);
-    }
-
     void worker(int t) {
-        while (running_.load(std::memory_order_relaxed)) {
+        // Parada segura: só thread 0 escreve running_=false, de dentro da
+        // seção sincronizada entre bar_pub_ e bar_pub2_. Assim todos os
+        // threads veem a mudança após bar_pub2_ e saem juntos — nenhum fica
+        // preso em barreira esperando outro que já saiu.
+        for (;;) {
             // Fase 0 — geometry (só thread líder)
             if (t == 0) {
                 uint32_t idx = angle_idx_.fetch_add(
@@ -120,13 +117,33 @@ class BenchmarkGPU {
             }
             bar_frag_.arrive_and_wait();
 
-            // Fase 2 — publicação (só thread líder)
-            if (t == 0) {
-                swap_buffers();
-                frame_count_.fetch_add(1, std::memory_order_relaxed);
-                cores_[0].load_program(geom_prog_);
+            // Fase 2 — copy + clear paralelos: framebuffer [0..N) e edge mask [N..2N)
+            {
+                size_t stripe = (total_pixels_ + (size_t)num_threads_ - 1) / (size_t)num_threads_;
+                size_t beg    = (size_t)t * stripe;
+                size_t end    = std::min(beg + stripe, total_pixels_);
+                std::copy(back_buf_.memory.begin()  + (ptrdiff_t)beg,
+                          back_buf_.memory.begin()  + (ptrdiff_t)end,
+                          front_buf_.memory.begin() + (ptrdiff_t)beg);
+                std::fill(back_buf_.memory.begin()  + (ptrdiff_t)beg,
+                          back_buf_.memory.begin()  + (ptrdiff_t)end, 0u);
+                std::fill(back_buf_.memory.begin()  + (ptrdiff_t)(total_pixels_ + beg),
+                          back_buf_.memory.begin()  + (ptrdiff_t)(total_pixels_ + end), 0u);
             }
             bar_pub_.arrive_and_wait();
+
+            // Só thread 0 decide parar — dentro da seção sincronizada.
+            // seq_cst garante que os outros threads vejam running_=false
+            // após bar_pub2_ independente de qual thread chega por último.
+            if (t == 0) {
+                frame_count_.fetch_add(1, std::memory_order_relaxed);
+                cores_[0].load_program(geom_prog_);
+                if (stop_requested_.load(std::memory_order_acquire))
+                    running_.store(false, std::memory_order_seq_cst);
+            }
+            bar_pub2_.arrive_and_wait();
+
+            if (!running_.load(std::memory_order_seq_cst)) break;
         }
     }
 
@@ -139,7 +156,7 @@ public:
           total_pixels_((size_t)W * (size_t)H),
           back_buf_(vl_total_size(total_pixels_)),
           front_buf_(total_pixels_),
-          bar_geom_(threads), bar_frag_(threads), bar_pub_(threads)
+          bar_geom_(threads), bar_frag_(threads), bar_pub_(threads), bar_pub2_(threads)
     {
         cores_.reserve((size_t)cores);
         for (int i = 0; i < cores; ++i)
@@ -159,12 +176,22 @@ public:
             cores_[i].load_program(frag_prog_);
     }
 
+    // Retorna true se num_threads > hardware_concurrency (spin barriers causam
+    // starvation severa com oversubscription — testes assim são pulados).
+    bool is_oversubscribed() const {
+        return num_threads_ > (int)std::thread::hardware_concurrency();
+    }
+
     // Roda warmup_ms de aquecimento + measure_ms de medição real.
     // Retorna {frames_contados, segundos_da_janela_de_medição}.
+    // Retorna {0, 0} se oversubscribed (teste pulado).
     std::pair<uint64_t, double> run(int warmup_ms, int measure_ms) {
-        running_.store(true,  std::memory_order_relaxed);
-        frame_count_.store(0, std::memory_order_relaxed);
-        angle_idx_.store(0,   std::memory_order_relaxed);
+        if (is_oversubscribed()) return {0, 0.0};
+
+        running_.store(true,          std::memory_order_seq_cst);
+        stop_requested_.store(false,  std::memory_order_seq_cst);
+        frame_count_.store(0,         std::memory_order_relaxed);
+        angle_idx_.store(0,           std::memory_order_relaxed);
 
         workers_.reserve((size_t)num_threads_);
         for (int t = 0; t < num_threads_; ++t)
@@ -176,7 +203,7 @@ public:
         frame_count_.store(0, std::memory_order_relaxed);
         auto t0 = std::chrono::steady_clock::now();
         std::this_thread::sleep_for(std::chrono::milliseconds(measure_ms));
-        running_.store(false, std::memory_order_relaxed);
+        stop_requested_.store(true, std::memory_order_release);  // thread 0 lerá isso
 
         for (auto& th : workers_) th.join();
         workers_.clear();
@@ -199,48 +226,88 @@ struct BenchResult {
     uint64_t   frames;
     double     elapsed_s, fps, mpix_s;
     size_t     geom_instr, frag_instr;
+    bool       skipped = false;
 };
 
 // ── Matriz de testes ───────────────────────────────────────────────────────
 //
 // 4 seções independentes que isolam cada variável:
-//   1 — threads  : varia COMPUTE_THREADS, fixa cores=14, res=1000×1000
-//   2 — núcleos  : varia NUM_CORES, fixa threads=min(cores,7), res=1000×1000
-//   3 — resolução: varia W×H, fixa cores=14, threads=7
-//   4 — grade    : produto cartesiano cores × threads (1000×1000)
+//   1 — threads  : sweep completo 1–16, fixa cores=14, res=1000×1000
+//   2 — núcleos  : sweep 1–32, fixa threads=7, res=1000×1000
+//   3 — resolução: 9 pontos de 128×128 a 2560×1440, fixa cores=14, threads=7
+//   4 — grade    : produto cartesiano denso cores × threads (1000×1000)
 //
 static const std::vector<TestConfig> TESTS = {
-    // Seção 1
+    // Seção 1 — threads (1 a 16, passo unitário até 8, depois 10/12/14/16)
     {14,  1, 1000, 1000, "1_threads"},
     {14,  2, 1000, 1000, "1_threads"},
+    {14,  3, 1000, 1000, "1_threads"},
     {14,  4, 1000, 1000, "1_threads"},
+    {14,  5, 1000, 1000, "1_threads"},
+    {14,  6, 1000, 1000, "1_threads"},
     {14,  7, 1000, 1000, "1_threads"},
+    {14,  8, 1000, 1000, "1_threads"},
+    {14, 10, 1000, 1000, "1_threads"},
+    {14, 12, 1000, 1000, "1_threads"},
     {14, 14, 1000, 1000, "1_threads"},
+    {14, 16, 1000, 1000, "1_threads"},
 
-    // Seção 2
+    // Seção 2 — núcleos (1 a 32, threads=7 fixo)
     { 1,  1, 1000, 1000, "2_cores"},
     { 2,  2, 1000, 1000, "2_cores"},
+    { 3,  3, 1000, 1000, "2_cores"},
     { 4,  4, 1000, 1000, "2_cores"},
+    { 5,  5, 1000, 1000, "2_cores"},
+    { 6,  6, 1000, 1000, "2_cores"},
+    { 7,  7, 1000, 1000, "2_cores"},
     { 8,  7, 1000, 1000, "2_cores"},
+    {10,  7, 1000, 1000, "2_cores"},
+    {12,  7, 1000, 1000, "2_cores"},
     {14,  7, 1000, 1000, "2_cores"},
+    {16,  7, 1000, 1000, "2_cores"},
+    {20,  7, 1000, 1000, "2_cores"},
+    {24,  7, 1000, 1000, "2_cores"},
     {28,  7, 1000, 1000, "2_cores"},
+    {32,  7, 1000, 1000, "2_cores"},
 
-    // Seção 3
+    // Seção 3 — resolução (9 pontos, cores=14, threads=7)
+    {14,  7,  128,  128, "3_resolution"},
     {14,  7,  256,  256, "3_resolution"},
+    {14,  7,  400,  400, "3_resolution"},
     {14,  7,  512,  512, "3_resolution"},
+    {14,  7,  640,  480, "3_resolution"},
+    {14,  7,  800,  600, "3_resolution"},
     {14,  7, 1000, 1000, "3_resolution"},
+    {14,  7, 1280,  720, "3_resolution"},
     {14,  7, 1920, 1080, "3_resolution"},
+    {14,  7, 2560, 1440, "3_resolution"},
 
-    // Seção 4
+    // Seção 4 — grade cores × threads (produto cartesiano denso, 1000×1000)
+    { 1,  1, 1000, 1000, "4_grid"},
+    { 2,  1, 1000, 1000, "4_grid"},
+    { 2,  2, 1000, 1000, "4_grid"},
     { 4,  1, 1000, 1000, "4_grid"},
     { 4,  2, 1000, 1000, "4_grid"},
     { 4,  4, 1000, 1000, "4_grid"},
+    { 7,  1, 1000, 1000, "4_grid"},
+    { 7,  4, 1000, 1000, "4_grid"},
+    { 7,  7, 1000, 1000, "4_grid"},
     { 8,  1, 1000, 1000, "4_grid"},
+    { 8,  2, 1000, 1000, "4_grid"},
     { 8,  4, 1000, 1000, "4_grid"},
     { 8,  8, 1000, 1000, "4_grid"},
+    {14,  1, 1000, 1000, "4_grid"},
+    {14,  2, 1000, 1000, "4_grid"},
+    {14,  4, 1000, 1000, "4_grid"},
+    {14,  7, 1000, 1000, "4_grid"},
+    {14, 14, 1000, 1000, "4_grid"},
     {16,  2, 1000, 1000, "4_grid"},
+    {16,  4, 1000, 1000, "4_grid"},
     {16,  8, 1000, 1000, "4_grid"},
     {16, 16, 1000, 1000, "4_grid"},
+    {28,  4, 1000, 1000, "4_grid"},
+    {28,  7, 1000, 1000, "4_grid"},
+    {28, 14, 1000, 1000, "4_grid"},
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -277,6 +344,14 @@ static std::string ftos(double v, int prec = 1) {
 
 // Uma linha da tabela: cores | threads | res | frames | FPS | Mpix/s [| eff%]
 static std::string fmt_row(const BenchResult& r, double base_fps = -1.0) {
+    if (r.skipped) {
+        std::ostringstream o;
+        o << std::setw(6)  << r.cfg.cores
+          << std::setw(9)  << r.cfg.threads
+          << "  " << std::left << std::setw(12) << res_str(r.cfg.W, r.cfg.H) << std::right
+          << "  -- SKIP (oversubscribed) --";
+        return o.str();
+    }
     std::ostringstream o;
     o << std::setw(6)  << r.cfg.cores
       << std::setw(9)  << r.cfg.threads
@@ -309,11 +384,13 @@ static std::string sep(int n = 70, char c = '-') { return std::string((size_t)n,
 // Geração do relatório completo
 // ══════════════════════════════════════════════════════════════════════════
 
+static const char* OUT_DIR = "TESTES_BENCHMARK/";
+
 static void write_report(const std::vector<BenchResult>& all,
                           int warmup_ms, int measure_ms) {
 
-    std::ofstream rep("benchmark_report.txt");
-    std::ofstream csv("benchmark_results.csv");
+    std::ofstream rep(std::string(OUT_DIR) + "benchmark_report.txt");
+    std::ofstream csv(std::string(OUT_DIR) + "benchmark_results.csv");
 
     // helper: filtra resultados por seção
     auto sec = [&](const std::string& tag) {
@@ -331,7 +408,7 @@ static void write_report(const std::vector<BenchResult>& all,
 
     // ── CSV ───────────────────────────────────────────────────────────────
     csv << "section,cores,threads,W,H,pixels,frames,elapsed_s,"
-           "fps,mpix_s,geom_instr,frag_instr,total_instr_per_frame\n";
+           "fps,mpix_s,geom_instr,frag_instr,total_instr_per_frame,skipped\n";
     for (const auto& r : all) {
         size_t total_instr = r.geom_instr + r.frag_instr * (size_t)r.cfg.cores;
         csv << r.cfg.section << ","
@@ -346,7 +423,8 @@ static void write_report(const std::vector<BenchResult>& all,
             << std::setprecision(2) << r.mpix_s << ","
             << r.geom_instr  << ","
             << r.frag_instr  << ","
-            << total_instr   << "\n";
+            << total_instr   << ","
+            << (r.skipped ? "1" : "0") << "\n";
     }
 
     // ── Cabeçalho do relatório ─────────────────────────────────────────────
@@ -370,7 +448,7 @@ static void write_report(const std::vector<BenchResult>& all,
         emit(sep(70, '=') + "\n");
         emit("SECAO 1 -- Escalabilidade de Threads\n");
         emit("  Fixo: 14 nucleos RV32I, resolucao 1000x1000\n");
-        emit("  Varia: numero de COMPUTE_THREADS (1 a 14)\n");
+        emit("  Varia: numero de COMPUTE_THREADS (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16)\n");
         emit(sep(70, '-') + "\n");
         emit(table_header(true) + "\n");
         emit(sep(70, '-') + "\n");
@@ -414,9 +492,8 @@ static void write_report(const std::vector<BenchResult>& all,
             emit("    - Fase 0 (geometry) e serial: apenas thread 0 trabalha\n");
             emit("      enquanto as outras " + std::to_string(nT-1)
                  + " threads ficam em spin na barrier_geom\n");
-            emit("    - geometry_shader tem loop de limpeza O(N): N="
-                 + std::to_string(rows[0]->cfg.W * rows[0]->cfg.H)
-                 + " iteracoes por frame\n");
+            emit("    - Geometry shader: rotacao de 8 vertices + 12 arestas Bresenham\n");
+            emit("      (limpeza da edge mask foi movida para fase 2 paralela)\n");
             emit("    - Overhead de spin na barrier (~3 ciclos/checagem)\n");
             emit("    - Lei de Amdahl: a fração serial limita o speedup maximo\n");
         }
@@ -430,7 +507,7 @@ static void write_report(const std::vector<BenchResult>& all,
         emit(sep(70, '=') + "\n");
         emit("SECAO 2 -- Escalabilidade de Nucleos RV32I\n");
         emit("  Fixo: resolucao 1000x1000  threads = min(cores, 7)\n");
-        emit("  Varia: NUM_CORES (1, 2, 4, 8, 14, 28)\n");
+        emit("  Varia: NUM_CORES (1–7 unitario, 8, 10, 12, 14, 16, 20, 24, 28, 32)\n");
         emit(sep(70, '-') + "\n");
         emit(table_header(true) + "\n");
         emit(sep(70, '-') + "\n");
@@ -468,7 +545,7 @@ static void write_report(const std::vector<BenchResult>& all,
         emit(sep(70, '=') + "\n");
         emit("SECAO 3 -- Impacto da Resolucao\n");
         emit("  Fixo: 14 nucleos, 7 threads\n");
-        emit("  Varia: resolucao (256x256 ate 1920x1080)\n");
+        emit("  Varia: resolucao (128x128 ate 2560x1440, 10 pontos)\n");
         emit(sep(70, '-') + "\n");
 
         // tabela especial com coluna de pixels
@@ -500,13 +577,13 @@ static void write_report(const std::vector<BenchResult>& all,
         emit("\nAnalise:\n");
         emit("  FPS cai com resolucao maior porque:\n");
         emit("    1. Fragment shader: O(N) pixels por frame\n");
-        emit("    2. Geometry shader: loop de limpeza O(N) iteracoes\n");
-        emit("    3. swap_buffers: std::copy de N palavras de 32 bits\n");
+        emit("    2. Geometry shader: serial (vertices + Bresenham), O(1) em N\n");
+        emit("    3. Fase 2 (copy+clear+mask paralelos): 2N/threads palavras por thread\n");
         emit("  O produto FPS x pixels = Mpix/s mede throughput real.\n");
         emit("  Se Mpix/s for constante em todas resolucoes -> pipeline\n");
         emit("  e limitado pelo processamento de pixels (compute-bound).\n");
         emit("  Se Mpix/s cair com resolucao maior -> limitado por\n");
-        emit("  memoria/banda ou overhead de limpeza O(N).\n");
+        emit("  largura de banda de memoria (load de 2N + store de 2N por frame).\n");
 
         if (rows.size() >= 2) {
             double mpix_first = rows.front()->mpix_s;
@@ -618,10 +695,11 @@ static void write_report(const std::vector<BenchResult>& all,
         // Overhead da fase serial
         emit("Nota sobre escalabilidade (Lei de Amdahl):\n");
         emit("  A fase 0 (geometry shader) e serial — so thread 0 trabalha.\n");
-        emit("  Ela inclui: rotacao de 8 vertices + 12 arestas Bresenham +\n");
-        emit("  loop de limpeza O(N). Para 1000x1000, sao ~1M iteracoes do\n");
-        emit("  loop de limpeza so. Isso cria um teto de speedup independente\n");
-        emit("  de quantas threads de calculo sao adicionadas.\n\n");
+        emit("  Ela inclui: rotacao de 8 vertices + 12 arestas Bresenham.\n");
+        emit("  A limpeza da edge mask foi movida para a fase 2 (paralela),\n");
+        emit("  eliminando o loop O(N) que dominava o tempo serial.\n");
+        emit("  O residuo serial e agora O(1) em N: ~500 instrucoes RV32I\n");
+        emit("  independente da resolucao. O teto de Amdahl sobe bastante.\n\n");
 
         emit("Legenda de colunas:\n");
         emit("  FPS       = frames por segundo (rendering headless, sem SDL)\n");
@@ -630,8 +708,8 @@ static void write_report(const std::vector<BenchResult>& all,
         emit("              100% = speedup linear perfeito (teorico)\n\n");
 
         emit("Arquivos gerados:\n");
-        emit("  benchmark_report.txt  — este relatorio\n");
-        emit("  benchmark_results.csv — dados brutos (abrir em planilha)\n\n");
+        emit("  TESTES_BENCHMARK/benchmark_report.txt  — este relatorio\n");
+        emit("  TESTES_BENCHMARK/benchmark_results.csv — dados brutos (abrir em planilha)\n\n");
 
         emit(sep(70, '=') + "\n");
     }
@@ -672,29 +750,37 @@ int main(int argc, char* argv[]) {
                   << " ... " << std::flush;
 
         BenchmarkGPU gpu(cfg.cores, cfg.threads, cfg.W, cfg.H);
-        auto [frames, elapsed] = gpu.run(warmup_ms, measure_ms);
 
         BenchResult r;
         r.cfg        = cfg;
-        r.frames     = frames;
-        r.elapsed_s  = elapsed;
-        r.fps        = (elapsed > 0.0) ? (double)frames / elapsed : 0.0;
-        r.mpix_s     = r.fps * (double)(cfg.W * cfg.H) / 1e6;
         r.geom_instr = gpu.geom_instr_count;
         r.frag_instr = gpu.frag_instr_count;
-        results.push_back(r);
 
-        std::cout << std::fixed << std::setprecision(1)
-                  << std::setw(7) << r.fps << " FPS"
-                  << std::setw(8) << r.mpix_s << " Mpix/s"
-                  << "  [geom=" << r.geom_instr << " frag=" << r.frag_instr << " instr]\n";
+        if (gpu.is_oversubscribed()) {
+            r.skipped  = true;
+            r.frames   = 0; r.elapsed_s = 0.0; r.fps = 0.0; r.mpix_s = 0.0;
+            std::cout << "  SKIP (threads=" << cfg.threads
+                      << " > HW=" << std::thread::hardware_concurrency()
+                      << ", spin starvation)\n";
+        } else {
+            auto [frames, elapsed] = gpu.run(warmup_ms, measure_ms);
+            r.frames    = frames;
+            r.elapsed_s = elapsed;
+            r.fps       = (elapsed > 0.0) ? (double)frames / elapsed : 0.0;
+            r.mpix_s    = r.fps * (double)(cfg.W * cfg.H) / 1e6;
+            std::cout << std::fixed << std::setprecision(1)
+                      << std::setw(7) << r.fps << " FPS"
+                      << std::setw(8) << r.mpix_s << " Mpix/s"
+                      << "  [geom=" << r.geom_instr << " frag=" << r.frag_instr << " instr]\n";
+        }
+        results.push_back(r);
     }
 
     std::cout << "\nGerando relatorio...\n\n";
     write_report(results, warmup_ms, measure_ms);
 
     std::cout << "\nArquivos gerados:\n";
-    std::cout << "  benchmark_report.txt\n";
-    std::cout << "  benchmark_results.csv\n\n";
+    std::cout << "  TESTES_BENCHMARK/benchmark_report.txt\n";
+    std::cout << "  TESTES_BENCHMARK/benchmark_results.csv\n\n";
     return 0;
 }

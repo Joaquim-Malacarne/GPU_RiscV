@@ -288,15 +288,10 @@ std::vector<uint32_t> build_geometry_shader(uint32_t N, uint32_t W, uint32_t H) 
     p.push_back(ADDI(10,  0,  8));      // 45 const 8
     p.push_back(BNE (24, 10, -180));    // 46 se v!=8 → volta (45 insts * 4 = 180)
 
-    // ── Limpa a edge mask [N, 2N) ─────────────────────────────────────────
-    p.push_back(ADDI(10,  4,  0));      // x10 = N  (início da mask)
-    p.push_back(ADD (30,  4,  4));      // x30 = 2N (fim exclusivo)
-    // clear_loop (3 insts): SW, ADDI, BNE
-    p.push_back(SW  ( 0, 10,  0));      // VRAM[x10] = 0
-    p.push_back(ADDI(10, 10,  1));      // x10++
-    p.push_back(BNE (10, 30,  -8));     // se x10 != 2N → volta
 
-    // ── 12 blocos Bresenham (39 insts cada) ──────────────────────────────
+    // ── 12 blocos Bresenham (39 insts cada) ─────────────────────────────────
+    // A edge mask [N,2N) é zerada pela fase 2 do pipeline C++ (paralelo).
+    // O geometry shader assume a mask limpa ao entrar.
     for (int e = 0; e < 12; e++)
         emit_bresenham(p, CUBE_EDGES[e][0], CUBE_EDGES[e][1], W, H);
 

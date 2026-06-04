@@ -19,8 +19,8 @@
  *   Fase 0  — thread líder (t=0): grava ângulo, executa geometry shader no núcleo 0,
  *             troca instruction_memory do núcleo 0 para fragment.
  *   Fase 1  — todas as 7 threads: reset + execute nos núcleos atribuídos (100% CPU).
- *   Fase 2  — thread líder: swap de buffers, publica em SharedFrame,
- *             restaura geometry no núcleo 0 para a próxima iteração.
+ *   Fase 2  — todas as 7 threads: copy + clear da sua fatia do buffer;
+ *             thread líder: publica em SharedFrame, restaura geometry no núcleo 0.
  *
  * Distribuição de núcleos entre 7 threads (stride = COMPUTE_THREADS):
  *   t0 → cores 0, 7, 14   t1 → cores 1, 8, 15   t2 → cores 2, 9
@@ -56,7 +56,6 @@ class GPUManager {
     std::atomic<uint32_t> angle_idx_{0};
     std::vector<std::thread> compute_threads_;
 
-    void swap_buffers();
     void worker(int t, SharedFrame& shared);
 
 public:

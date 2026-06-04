@@ -3,13 +3,18 @@ gpu_v
 benchmark
 teste
 
-# Objetos
+# Arquivos objeto
 *.o
 
-# PDFs e materiais externos
+# PDFs, LaTeX e materiais externos
 PDF/
+PDF_overleaf.zip
 
-# Arquivos temporários
+# Resultados de benchmark e arquivos temporários
+TESTES_BENCHMARK/
 *.csv
 benchmark_report.txt
+
+# Arquivos de rascunho
 prompt_notebooklm.md
+teste.cpp

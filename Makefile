@@ -26,8 +26,13 @@ benchmark: $(BENCH_OBJS)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
+run-benchmark: benchmark
+	./$(BENCH_TARGET) 2>&1 | tee TESTES_BENCHMARK/benchmark_stdout.txt
+
 clean:
 	rm -f $(OBJS) $(BENCH_OBJS) $(TARGET) $(BENCH_TARGET) \
-	      benchmark_report.txt benchmark_results.csv
+	      TESTES_BENCHMARK/benchmark_report.txt \
+	      TESTES_BENCHMARK/benchmark_results.csv \
+	      TESTES_BENCHMARK/benchmark_stdout.txt
 
-.PHONY: all benchmark clean
+.PHONY: all benchmark run-benchmark clean

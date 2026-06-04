@@ -57,13 +57,6 @@ void GPUManager::set_programs(const std::vector<uint32_t>& geom,
         processing_units[i].load_program(frag_prog_);
 }
 
-void GPUManager::swap_buffers() {
-    std::copy(back_buffer.memory.begin(),
-              back_buffer.memory.begin() + (ptrdiff_t)total_pixels,
-              front_buffer.memory.begin());
-    std::fill(back_buffer.memory.begin(),
-              back_buffer.memory.begin() + (ptrdiff_t)total_pixels, 0u);
-}
 
 // Corpo de cada uma das COMPUTE_THREADS threads de cálculo.
 // Spin puro: nenhuma chamada a sleep/wait — 100% de CPU o tempo todo.
@@ -91,10 +84,26 @@ void GPUManager::worker(int t, SharedFrame& shared) {
         }
         barrier_frag_.arrive_and_wait();
 
-        // ── Fase 2: publicação ───────────────────────────────────────────
-        // Apenas a thread líder; as demais fazem spin em barrier_pub_.
+        // ── Fase 2: copy + clear paralelos ──────────────────────────────
+        // Cada thread processa sua fatia de [0..N) (framebuffer) e [N..2N)
+        // (edge mask). Isso elimina o loop O(N) que era serial no geometry shader.
+        {
+            size_t stripe = (total_pixels + (size_t)COMPUTE_THREADS - 1) / (size_t)COMPUTE_THREADS;
+            size_t beg    = (size_t)t * stripe;
+            size_t end    = std::min(beg + stripe, total_pixels);
+            // copia framebuffer → front e zera back
+            std::copy(back_buffer.memory.begin()  + (ptrdiff_t)beg,
+                      back_buffer.memory.begin()  + (ptrdiff_t)end,
+                      front_buffer.memory.begin() + (ptrdiff_t)beg);
+            std::fill(back_buffer.memory.begin()  + (ptrdiff_t)beg,
+                      back_buffer.memory.begin()  + (ptrdiff_t)end, 0u);
+            // zera edge mask [N+beg .. N+end)
+            std::fill(back_buffer.memory.begin()  + (ptrdiff_t)(total_pixels + beg),
+                      back_buffer.memory.begin()  + (ptrdiff_t)(total_pixels + end), 0u);
+        }
+        barrier_pub_.arrive_and_wait();
+
         if (t == 0) {
-            swap_buffers();
             {
                 std::lock_guard<std::mutex> lk(shared.mtx);
                 if (shared.stop) {
